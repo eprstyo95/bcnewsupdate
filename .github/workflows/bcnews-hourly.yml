@@ -1,19 +1,20 @@
-name: bcnews hourly
+name: bcnews 5min
 
 on:
   schedule:
-    - cron: "0 * * * *"   # runs every hour (UTC)
-  workflow_dispatch:       # allow manual run
+    - cron: "*/5 * * * *"   # every 5 minutes (UTC)
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -23,10 +24,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bc news script
+      - name: Cache seen database
+        uses: actions/cache@v4
+        with:
+          path: seen.sqlite
+          key: seen-db
+
+      - name: Run bc news update
         env:
           NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python bc_news_update.py
+
