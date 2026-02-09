@@ -9,7 +9,7 @@ from urllib.parse import quote
 # =========================
 # SETTINGS
 # =========================
-GOOGLE_RSS_SIZE = 10
+GOOGLE_RSS_SIZE = 15
 DB_FILE = "seen.sqlite"
 
 QUERY = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan"'
@@ -68,7 +68,7 @@ def send_telegram(text: str):
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": False},
         timeout=20,
     )
-    print("Telegram:", r.status_code)
+    print("Telegram:", r.status_code, r.text[:120])
 
 # =========================
 # GOOGLE NEWS RSS
@@ -113,7 +113,7 @@ def main():
         )
         send_telegram(msg)
 
-    print(f"Done. New alerts: {new_count}")
+    print(f"Done. New alerts: {new_count}. Total fetched: {len(items)}")
 
 if __name__ == "__main__":
     main()
