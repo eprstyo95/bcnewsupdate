@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+  push:
+    branches: ["main"]
 
 jobs:
   run:
@@ -13,9 +15,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-	with:
-	  token: ${{ secrets.GITHUB_TOKEN }}
-	  fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5

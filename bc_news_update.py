@@ -11,7 +11,6 @@ from urllib.parse import quote
 # =========================
 GOOGLE_RSS_SIZE = 15
 DB_FILE = "seen.sqlite"
-
 QUERY = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan"'
 
 # =========================
@@ -112,6 +111,9 @@ def main():
             f"🔗 {url}"
         )
         send_telegram(msg)
+
+    # ALWAYS send confirmation message (so you know it ran)
+    send_telegram(f"✅ BC monitor ran OK. New alerts: {new_count}. Total fetched: {len(items)}")
 
     print(f"Done. New alerts: {new_count}. Total fetched: {len(items)}")
 
