@@ -20,17 +20,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Cache seen database
-        uses: actions/cache@v4
+      # ✅ FIX: restore the last seen.sqlite, then save an updated one (no more "stuck" cache)
+      - name: Restore seen database cache
+        uses: actions/cache/restore@v4
         with:
           path: seen.sqlite
-          key: seen-db
+          key: seen-db-${{ github.ref_name }}
+          restore-keys: |
+            seen-db-${{ github.ref_name }}-
+            seen-db-
 
       - name: Run bc news update
         env:
@@ -39,3 +44,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python bc_news_update.py
+
+      - name: Save seen database cache
+        uses: actions/cache/save@v4
+        with:
+          path: seen.sqlite
+          key: seen-db-${{ github.ref_name }}-${{ github.run_id }}
+
