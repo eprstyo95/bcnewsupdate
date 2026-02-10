@@ -4,7 +4,7 @@ import sqlite3
 import requests
 import feedparser
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 
 # =========================
 # SETTINGS
@@ -12,7 +12,8 @@ from urllib.parse import quote
 DB_FILE = "seen.sqlite"
 
 # Query utama (RSS + NewsAPI)
-QUERY_RSS = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan"'
+# (3) Tambahin operator waktu Google News: when:24h (sesuaikan dengan MAX_AGE_HOURS kalau mau)
+QUERY_RSS = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan" when:24h'
 QUERY_NEWSAPI = '"bea cukai" OR DJBC OR Kemenkeu OR "Kementerian Keuangan"'
 
 # Berapa jam ke belakang yang dianggap "latest"
@@ -71,10 +72,32 @@ def mark_seen(url: str):
 # =========================
 # HELPERS
 # =========================
+TRACKING_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}
+
 def norm_url(u: str) -> str:
+    """Normalize URL: drop fragment + common tracking params (kept minimal & safe)."""
     if not u:
         return ""
-    return u.split("#", 1)[0].strip()
+    u = u.split("#", 1)[0].strip()
+    parts = urlsplit(u)
+    q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in TRACKING_PARAMS]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), ""))
+
+# (2) Google News RSS URL -> resolve final URL (follow redirects)
+def resolve_final_url(u: str) -> str:
+    if not u:
+        return ""
+    u = norm_url(u)
+    try:
+        r = requests.get(
+            u,
+            timeout=15,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        return norm_url(r.url)
+    except Exception:
+        return u
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -117,10 +140,11 @@ def fetch_google_news_rss(query: str):
     out = []
     for entry in feed.entries[:GOOGLE_RSS_SIZE]:
         pub = entry_published_utc(entry)
+        link = entry.get("link") or ""
         out.append({
             "source": "GoogleNews",
             "title": (entry.get("title") or "").strip(),
-            "url": norm_url(entry.get("link") or ""),
+            "url": resolve_final_url(link),  # (2) resolve final URL
             "published_utc": pub,
         })
     return out
@@ -128,7 +152,7 @@ def fetch_google_news_rss(query: str):
 # =========================
 # NEWSAPI
 # =========================
-def fetch_newsapi(query: str):
+def fetch_newsapi(query: str, cutoff_utc: datetime):
     if not NEWSAPI_KEY:
         return []
 
@@ -140,6 +164,8 @@ def fetch_newsapi(query: str):
         "pageSize": NEWSAPI_PAGE_SIZE,
         "apiKey": NEWSAPI_KEY,
         "excludeDomains": NEWSAPI_EXCLUDE_DOMAINS,
+        # (4) parameter from newsapi: batasi rentang sesuai cutoff
+        "from": cutoff_utc.isoformat(),
     }
     if NEWSAPI_LANGUAGE:
         params["language"] = NEWSAPI_LANGUAGE
@@ -173,13 +199,12 @@ def main():
 
     items = []
     items += fetch_google_news_rss(QUERY_RSS)
-    items += fetch_newsapi(QUERY_NEWSAPI)
+    items += fetch_newsapi(QUERY_NEWSAPI, cutoff)  # (4) pass cutoff for NewsAPI from=
 
     # Deduplicate within this run by URL
     by_url = {}
     for it in items:
         if it["url"]:
-            # Keep the one with a publish date if possible
             if it["url"] not in by_url:
                 by_url[it["url"]] = it
             else:
@@ -187,6 +212,13 @@ def main():
                     by_url[it["url"]] = it
 
     items = list(by_url.values())
+
+    # (1) Urutan berita: sort published_utc desc (latest dulu)
+    items = sorted(
+        items,
+        key=lambda x: x.get("published_utc") or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True
+    )
 
     new_count = 0
     too_old = 0
@@ -221,7 +253,7 @@ def main():
         )
         send_telegram(msg)
 
-    # Confirmation (kalau mau; ini bikin kamu tahu workflow jalan)
+    # Confirmation (heartbeat)
     send_telegram(
         f"✅ BC monitor OK. New: {new_count}. Skipped old: {too_old}. "
         f"No-date skipped: {no_date}. Fetched: {len(items)}. Window: {MAX_AGE_HOURS}h."
@@ -231,3 +263,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
