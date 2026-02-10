@@ -1,8 +1,6 @@
 name: bcnews 5min
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
   push:
     branches: ["main"]
@@ -27,7 +25,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ FIX: restore the last seen.sqlite, then save an updated one (no more "stuck" cache)
       - name: Restore seen database cache
         uses: actions/cache/restore@v4
         with:
@@ -50,4 +47,3 @@ jobs:
         with:
           path: seen.sqlite
           key: seen-db-${{ github.ref_name }}-${{ github.run_id }}
-
