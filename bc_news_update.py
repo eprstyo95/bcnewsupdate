@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import re
+import html
 import hashlib
 import sqlite3
 import requests
@@ -24,10 +25,10 @@ NEWSAPI_PAGE_SIZE = 20
 NEWSAPI_LANGUAGE = "id"  # set None kalau mau global
 NEWSAPI_EXCLUDE_DOMAINS = "globenewswire.com,prnewswire.com,businesswire.com"
 
-MAX_ITEMS_PER_BATCH = 1
+MAX_ITEMS_PER_BATCH = 8
 SEND_HEARTBEAT = True
 
-DEBUG_NEWSAPI = True  # set False kalau sudah OK
+DEBUG_NEWSAPI = False  # set True kalau mau debug NewsAPI
 
 WIB = timezone(timedelta(hours=7))
 
@@ -73,87 +74,6 @@ def request_with_retry(
 # =========================
 # DATABASE (SEEN) + MIGRATION
 # =========================
-def init_db(con: sqlite3.Connection):
-    """
-    Init + auto-migrate schema:
-    - OLD schema: seen(url TEXT PRIMARY KEY, first_seen_utc TEXT)
-    - NEW schema: seen(fingerprint TEXT PRIMARY KEY, url TEXT, title TEXT, first_seen_utc TEXT)
-    """
-    cur = con.cursor()
-
-    # Check if table exists
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='seen'")
-    exists = cur.fetchone() is not None
-
-    if not exists:
-        # Fresh DB -> create new schema
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS seen (
-                fingerprint TEXT PRIMARY KEY,
-                url TEXT,
-                title TEXT,
-                first_seen_utc TEXT
-            )
-        """)
-        con.commit()
-        return
-
-    # Inspect columns of existing table
-    cur.execute("PRAGMA table_info(seen)")
-    cols = [row[1] for row in cur.fetchall()]
-
-    # Already new schema
-    if "fingerprint" in cols:
-        return
-
-    # Old schema detected -> migrate
-    print("🔁 Migrating seen.sqlite schema: old(url) -> new(fingerprint,url,title,first_seen_utc)")
-
-    # Rename old table (keep as backup)
-    cur.execute("ALTER TABLE seen RENAME TO seen_old")
-
-    # Create new schema
-    cur.execute("""
-        CREATE TABLE seen (
-            fingerprint TEXT PRIMARY KEY,
-            url TEXT,
-            title TEXT,
-            first_seen_utc TEXT
-        )
-    """)
-
-    # Copy rows from old into new, computing fingerprint from URL (title unknown in old schema)
-    cur.execute("SELECT url, first_seen_utc FROM seen_old")
-    rows = cur.fetchall()
-
-    for url, first_seen_utc in rows:
-        fp = make_fingerprint(url or "", "")  # title not available in old schema
-        cur.execute(
-            "INSERT OR IGNORE INTO seen (fingerprint, url, title, first_seen_utc) VALUES (?, ?, ?, ?)",
-            (fp, url, "", first_seen_utc),
-        )
-
-    # Optional cleanup (keep backup by default). Uncomment to delete:
-    # cur.execute("DROP TABLE seen_old")
-
-    con.commit()
-
-def is_seen(con: sqlite3.Connection, fingerprint: str) -> bool:
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM seen WHERE fingerprint = ?", (fingerprint,))
-    return cur.fetchone() is not None
-
-def mark_seen(con: sqlite3.Connection, fingerprint: str, url: str, title: str):
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO seen (fingerprint, url, title, first_seen_utc) VALUES (?, ?, ?, ?)",
-        (fingerprint, url, title, datetime.now(timezone.utc).isoformat())
-    )
-    con.commit()
-
-# =========================
-# HELPERS
-# =========================
 TRACKING_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}
 
 def norm_url(u: str) -> str:
@@ -176,12 +96,83 @@ def make_fingerprint(url: str, title: str) -> str:
     base = f"{norm_url(url)}|{normalize_title(title)}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
+def init_db(con: sqlite3.Connection):
+    """
+    Init + auto-migrate schema:
+    - OLD schema: seen(url TEXT PRIMARY KEY, first_seen_utc TEXT)
+    - NEW schema: seen(fingerprint TEXT PRIMARY KEY, url TEXT, title TEXT, first_seen_utc TEXT)
+    """
+    cur = con.cursor()
+
+    # Check if table exists
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='seen'")
+    exists = cur.fetchone() is not None
+
+    if not exists:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS seen (
+                fingerprint TEXT PRIMARY KEY,
+                url TEXT,
+                title TEXT,
+                first_seen_utc TEXT
+            )
+        """)
+        con.commit()
+        return
+
+    # Inspect columns
+    cur.execute("PRAGMA table_info(seen)")
+    cols = [row[1] for row in cur.fetchall()]
+
+    if "fingerprint" in cols:
+        return
+
+    # Old schema -> migrate
+    print("🔁 Migrating seen.sqlite schema: old(url) -> new(fingerprint,url,title,first_seen_utc)")
+    cur.execute("ALTER TABLE seen RENAME TO seen_old")
+
+    cur.execute("""
+        CREATE TABLE seen (
+            fingerprint TEXT PRIMARY KEY,
+            url TEXT,
+            title TEXT,
+            first_seen_utc TEXT
+        )
+    """)
+
+    cur.execute("SELECT url, first_seen_utc FROM seen_old")
+    rows = cur.fetchall()
+
+    for url, first_seen_utc in rows:
+        fp = make_fingerprint(url or "", "")
+        cur.execute(
+            "INSERT OR IGNORE INTO seen (fingerprint, url, title, first_seen_utc) VALUES (?, ?, ?, ?)",
+            (fp, url, "", first_seen_utc),
+        )
+
+    con.commit()
+
+def is_seen(con: sqlite3.Connection, fingerprint: str) -> bool:
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM seen WHERE fingerprint = ?", (fingerprint,))
+    return cur.fetchone() is not None
+
+def mark_seen(con: sqlite3.Connection, fingerprint: str, url: str, title: str):
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO seen (fingerprint, url, title, first_seen_utc) VALUES (?, ?, ?, ?)",
+        (fingerprint, url, title, datetime.now(timezone.utc).isoformat())
+    )
+    con.commit()
+
+# =========================
+# MORE HELPERS
+# =========================
 def resolve_final_url(session: requests.Session, u: str) -> str:
     if not u:
         return ""
     u = norm_url(u)
 
-    # HEAD first (faster)
     try:
         r = request_with_retry(session, "HEAD", u, timeout=12, allow_redirects=True)
         if r is not None and getattr(r, "url", None):
@@ -189,7 +180,6 @@ def resolve_final_url(session: requests.Session, u: str) -> str:
     except Exception:
         pass
 
-    # GET stream fallback
     try:
         r = request_with_retry(session, "GET", u, timeout=15, allow_redirects=True, stream=True)
         if r is not None and getattr(r, "url", None):
@@ -225,28 +215,23 @@ def make_hashtags(title: str, url: str = ""):
     u = (url or "").lower()
 
     TAGS = [
-        # CORE INSTITUTION
         (["djbc", "bea cukai", "customs"], "#DJBC"),
         (["kemenkeu", "kementerian keuangan", "menkeu", "sri mulyani"], "#Kemenkeu"),
         (["kanwil", "kppbc", "kantor bea cukai"], "#KantorBC"),
 
-        # SPECIFIC PERSON / LOCATION
         (["purbaya yudhi", "purbaya yudhi sadewa", "purbaya"], "#Purbaya"),
         (["marunda", "kawasan marunda", "pelabuhan marunda"], "#Marunda"),
 
-        # TRADE FLOW
         (["impor", "import"], "#Impor"),
         (["ekspor", "export"], "#Ekspor"),
         (["transit"], "#Transit"),
         (["re-ekspor", "reekspor"], "#ReEkspor"),
 
-        # FACILITIES
         (["plb", "pusat logistik berikat"], "#PLB"),
         (["kawasan berikat", "kb"], "#KawasanBerikat"),
         (["kite", "ikm"], "#KITE"),
         (["gudang berikat"], "#GudangBerikat"),
 
-        # ENFORCEMENT
         (["penindakan", "operasi", "sitaan", "gagalkan"], "#Penindakan"),
         (["penyelundupan", "smuggling", "ilegal"], "#Penyelundupan"),
         (["rokok ilegal", "rokok tanpa pita cukai"], "#RokokIlegal"),
@@ -254,14 +239,12 @@ def make_hashtags(title: str, url: str = ""):
         (["miras", "minuman keras"], "#Miras"),
         (["barang kena cukai"], "#BKC"),
 
-        # FISCAL & TARIFF
         (["tarif", "bea masuk"], "#BeaMasuk"),
         (["pajak", "ppn", "pnbp"], "#PenerimaanNegara"),
         (["cukai"], "#Cukai"),
         (["anti dumping", "bea masuk anti dumping"], "#AntiDumping"),
         (["safeguard"], "#Safeguard"),
 
-        # REGULATION
         (["aturan", "pmk", "peraturan", "regulasi"], "#Regulasi"),
         (["revisi aturan", "perubahan pmk"], "#PerubahanAturan"),
         (["wco"], "#WCO"),
@@ -270,13 +253,11 @@ def make_hashtags(title: str, url: str = ""):
         (["fta", "perjanjian perdagangan"], "#FTA"),
         (["ska", "certificate of origin", "coo"], "#SKA"),
 
-        # LOGISTICS & PORT
         (["pelabuhan", "tanjung priok"], "#TanjungPriok"),
         (["soekarno hatta", "bandara"], "#Bandara"),
         (["logistik", "supply chain"], "#Logistik"),
         (["container", "peti kemas"], "#Container"),
 
-        # SECTOR SPECIFIC
         (["tembakau"], "#Tembakau"),
         (["rokok"], "#Rokok"),
         (["tekstil", "tpt"], "#Tekstil"),
@@ -285,7 +266,6 @@ def make_hashtags(title: str, url: str = ""):
         (["elektronik"], "#Elektronik"),
         (["minyak sawit", "cpo"], "#Sawit"),
 
-        # GOVERNANCE & POLICY
         (["transformasi", "digitalisasi"], "#Digitalisasi"),
         (["zona integritas"], "#ZonaIntegritas"),
         (["reformasi birokrasi"], "#ReformasiBirokrasi"),
@@ -314,7 +294,7 @@ def short_display_url(u: str, max_len: int = 60) -> str:
     return display
 
 # =========================
-# TELEGRAM
+# TELEGRAM (HTML link + preview off)
 # =========================
 def telegram_send(session: requests.Session, text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -327,7 +307,12 @@ def telegram_send(session: requests.Session, text: str):
         "POST",
         url,
         timeout=25,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": False},
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,   # ✅ requested
+        },
     )
     print("Telegram:", r.status_code, (r.text or "")[:140])
 
@@ -369,13 +354,21 @@ def _send_one_batch(session: requests.Session, batch):
         tags = " ".join(make_hashtags(title, url))
         short_label = short_display_url(url)
 
+        # HTML-escape content
+        title_h = html.escape(title)
+        src_h = html.escape(src)
+        tags_h = html.escape(tags)
+        label_h = html.escape(short_label)
+        url_h = html.escape(url)
+
+        link_line = f'🔗 <a href="{url_h}">{label_h}</a>'
+
         lines.append("")
-        lines.append(f"📰 {title}")
+        lines.append(f"📰 {title_h}")
         lines.append(f"🕒 {fmt_wib(pub)}")
-        lines.append(f"📌 {src}")
-        lines.append(f"🏷️ {tags}")
-        lines.append(f"🔗 {short_label}")
-        lines.append(url)
+        lines.append(f"📌 {src_h}")
+        lines.append(f"🏷️ {tags_h}")
+        lines.append(link_line)
 
     text = "\n".join(lines)
     for part in chunk_text(text):
@@ -402,7 +395,7 @@ def fetch_google_news_rss(session: requests.Session, query: str):
     return out
 
 # =========================
-# NEWSAPI (fixed + debug)
+# NEWSAPI (debug-friendly)
 # =========================
 def fetch_newsapi(session: requests.Session, query: str, cutoff_utc: datetime):
     if not NEWSAPI_KEY:
@@ -411,7 +404,6 @@ def fetch_newsapi(session: requests.Session, query: str, cutoff_utc: datetime):
         return []
 
     url = "https://newsapi.org/v2/everything"
-
     cutoff_str = cutoff_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     to_str = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -528,10 +520,8 @@ def main():
             mark_seen(con, fp, url, title)
             new_items.append(it)
 
-        # Send updates batched
         send_updates_batched(session, new_items)
 
-        # Heartbeat
         if SEND_HEARTBEAT:
             telegram_send(
                 session,
