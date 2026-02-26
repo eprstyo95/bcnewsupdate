@@ -1,13 +1,6 @@
 name: bcnews 5min
 
 on:
-  workflow_dispatch:
-  push:
-    branches: ["main"]
-
-name: bcnews 5min
-
-on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -22,7 +15,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
