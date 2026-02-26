@@ -24,7 +24,7 @@ NEWSAPI_PAGE_SIZE = 20
 NEWSAPI_LANGUAGE = "id"  # set None kalau mau global
 NEWSAPI_EXCLUDE_DOMAINS = "globenewswire.com,prnewswire.com,businesswire.com"
 
-MAX_ITEMS_PER_BATCH = 8
+MAX_ITEMS_PER_BATCH = 1
 SEND_HEARTBEAT = True
 
 DEBUG_NEWSAPI = True  # set False kalau sudah OK
