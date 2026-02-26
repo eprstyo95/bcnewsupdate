@@ -27,8 +27,7 @@ NEWSAPI_EXCLUDE_DOMAINS = "globenewswire.com,prnewswire.com,businesswire.com"
 MAX_ITEMS_PER_BATCH = 8
 SEND_HEARTBEAT = True
 
-# Debug helper (buat lihat kenapa NewsAPI kosong)
-DEBUG_NEWSAPI = True
+DEBUG_NEWSAPI = True  # set False kalau sudah OK
 
 WIB = timezone(timedelta(hours=7))
 
@@ -72,18 +71,71 @@ def request_with_retry(
     raise last_err
 
 # =========================
-# DATABASE (SEEN)
+# DATABASE (SEEN) + MIGRATION
 # =========================
 def init_db(con: sqlite3.Connection):
+    """
+    Init + auto-migrate schema:
+    - OLD schema: seen(url TEXT PRIMARY KEY, first_seen_utc TEXT)
+    - NEW schema: seen(fingerprint TEXT PRIMARY KEY, url TEXT, title TEXT, first_seen_utc TEXT)
+    """
     cur = con.cursor()
+
+    # Check if table exists
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='seen'")
+    exists = cur.fetchone() is not None
+
+    if not exists:
+        # Fresh DB -> create new schema
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS seen (
+                fingerprint TEXT PRIMARY KEY,
+                url TEXT,
+                title TEXT,
+                first_seen_utc TEXT
+            )
+        """)
+        con.commit()
+        return
+
+    # Inspect columns of existing table
+    cur.execute("PRAGMA table_info(seen)")
+    cols = [row[1] for row in cur.fetchall()]
+
+    # Already new schema
+    if "fingerprint" in cols:
+        return
+
+    # Old schema detected -> migrate
+    print("🔁 Migrating seen.sqlite schema: old(url) -> new(fingerprint,url,title,first_seen_utc)")
+
+    # Rename old table (keep as backup)
+    cur.execute("ALTER TABLE seen RENAME TO seen_old")
+
+    # Create new schema
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
+        CREATE TABLE seen (
             fingerprint TEXT PRIMARY KEY,
             url TEXT,
             title TEXT,
             first_seen_utc TEXT
         )
     """)
+
+    # Copy rows from old into new, computing fingerprint from URL (title unknown in old schema)
+    cur.execute("SELECT url, first_seen_utc FROM seen_old")
+    rows = cur.fetchall()
+
+    for url, first_seen_utc in rows:
+        fp = make_fingerprint(url or "", "")  # title not available in old schema
+        cur.execute(
+            "INSERT OR IGNORE INTO seen (fingerprint, url, title, first_seen_utc) VALUES (?, ?, ?, ?)",
+            (fp, url, "", first_seen_utc),
+        )
+
+    # Optional cleanup (keep backup by default). Uncomment to delete:
+    # cur.execute("DROP TABLE seen_old")
+
     con.commit()
 
 def is_seen(con: sqlite3.Connection, fingerprint: str) -> bool:
@@ -494,7 +546,6 @@ def main():
         )
 
     except Exception as e:
-        # Make failure visible in Actions logs + Telegram (kalau token ada)
         err = f"❌ BC monitor FAILED: {type(e).__name__}: {e}"
         print(err)
         try:
