@@ -176,19 +176,71 @@ def make_hashtags(title: str, url: str = "") -> list[str]:
     u = (url or "").lower()
 
     TAGS = [
+        # CORE INSTITUTION
         (["djbc", "bea cukai", "customs"], "#DJBC"),
         (["kemenkeu", "kementerian keuangan", "menkeu", "sri mulyani"], "#Kemenkeu"),
+        (["kanwil", "kppbc", "kantor bea cukai"], "#KantorBC"),
+
+        # SPECIFIC PERSON / LOCATION
+        (["purbaya yudhi", "purbaya yudhi sadewa", "purbaya"], "#Purbaya"),
+        (["marunda", "kawasan marunda", "pelabuhan marunda"], "#Marunda"),
+
+        # TRADE FLOW
         (["impor", "import"], "#Impor"),
         (["ekspor", "export"], "#Ekspor"),
-        (["rokok", "tembakau", "cukai", "sigaret"], "#Cukai"),
-        (["narkoba", "drug", "meth", "sabu", "kokain"], "#Narkotika"),
-        (["penyelundupan", "smuggling", "ilegal"], "#Penyelundupan"),
-        (["plb", "kawasan berikat", "kb", "kite"], "#Fasilitas"),
-        (["pelabuhan", "tanjung priok", "soekarno hatta", "bandara"], "#Logistik"),
-        (["tarif", "bea masuk", "pajak", "ppn", "pnbp"], "#Tarif"),
-        (["wco", "wto", "asean", "fta", "ska", "origin"], "#Perdagangan"),
+        (["transit"], "#Transit"),
+        (["re-ekspor", "reekspor"], "#ReEkspor"),
+
+        # FACILITIES
+        (["plb", "pusat logistik berikat"], "#PLB"),
+        (["kawasan berikat", "kb"], "#KawasanBerikat"),
+        (["kite", "ikm"], "#KITE"),
+        (["gudang berikat"], "#GudangBerikat"),
+
+        # ENFORCEMENT
         (["penindakan", "operasi", "sitaan", "gagalkan"], "#Penindakan"),
+        (["penyelundupan", "smuggling", "ilegal"], "#Penyelundupan"),
+        (["rokok ilegal", "rokok tanpa pita cukai"], "#RokokIlegal"),
+        (["narkoba", "drug", "meth", "sabu", "kokain"], "#Narkotika"),
+        (["miras", "minuman keras"], "#Miras"),
+        (["barang kena cukai"], "#BKC"),
+
+        # FISCAL & TARIFF
+        (["tarif", "bea masuk"], "#BeaMasuk"),
+        (["pajak", "ppn", "pnbp"], "#PenerimaanNegara"),
+        (["cukai"], "#Cukai"),
+        (["anti dumping", "bea masuk anti dumping"], "#AntiDumping"),
+        (["safeguard"], "#Safeguard"),
+
+        # REGULATION
         (["aturan", "pmk", "peraturan", "regulasi"], "#Regulasi"),
+        (["revisi aturan", "perubahan pmk"], "#PerubahanAturan"),
+        (["wco"], "#WCO"),
+        (["wto"], "#WTO"),
+        (["asean"], "#ASEAN"),
+        (["fta", "perjanjian perdagangan"], "#FTA"),
+        (["ska", "certificate of origin", "coo"], "#SKA"),
+
+        # LOGISTICS & PORT
+        (["pelabuhan", "tanjung priok"], "#TanjungPriok"),
+        (["soekarno hatta", "bandara"], "#Bandara"),
+        (["logistik", "supply chain"], "#Logistik"),
+        (["container", "peti kemas"], "#Container"),
+
+        # SECTOR SPECIFIC
+        (["tembakau"], "#Tembakau"),
+        (["rokok"], "#Rokok"),
+        (["tekstil", "tpt"], "#Tekstil"),
+        (["baja", "steel"], "#Baja"),
+        (["otomotif"], "#Otomotif"),
+        (["elektronik"], "#Elektronik"),
+        (["minyak sawit", "cpo"], "#Sawit"),
+
+        # GOVERNANCE & POLICY
+        (["transformasi", "digitalisasi"], "#Digitalisasi"),
+        (["zona integritas"], "#ZonaIntegritas"),
+        (["reformasi birokrasi"], "#ReformasiBirokrasi"),
+        (["pengawasan"], "#Pengawasan"),
     ]
 
     out = []
