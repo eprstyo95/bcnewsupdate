@@ -13,24 +13,22 @@ from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 # =========================
 DB_FILE = "seen.sqlite"
 
-# Query utama (RSS + NewsAPI)
 QUERY_RSS = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan" when:24h'
-QUERY_NEWSAPI = '"bea cukai" OR DJBC OR Kemenkeu OR "Kementerian Keuangan"'
+QUERY_NEWSAPI = '(bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan")'
 
-# Berapa jam ke belakang yang dianggap "latest"
 MAX_AGE_HOURS = 24
 
-# Batas jumlah item yang ditarik per run
 GOOGLE_RSS_SIZE = 30
 NEWSAPI_PAGE_SIZE = 20
 
-# NewsAPI tuning (biar nggak banyak press-release)
 NEWSAPI_LANGUAGE = "id"  # set None kalau mau global
 NEWSAPI_EXCLUDE_DOMAINS = "globenewswire.com,prnewswire.com,businesswire.com"
 
-# Telegram batching
 MAX_ITEMS_PER_BATCH = 8
-SEND_HEARTBEAT = True  # set False kalau mau silent saat tidak ada update
+SEND_HEARTBEAT = True
+
+# Debug helper (buat lihat kenapa NewsAPI kosong)
+DEBUG_NEWSAPI = True
 
 WIB = timezone(timedelta(hours=7))
 
@@ -38,8 +36,8 @@ WIB = timezone(timedelta(hours=7))
 # ENV VARS (GitHub Secrets)
 # =========================
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")  # allow RSS-only
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================
 # HTTP SESSION + RETRY
@@ -107,7 +105,6 @@ def mark_seen(con: sqlite3.Connection, fingerprint: str, url: str, title: str):
 TRACKING_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}
 
 def norm_url(u: str) -> str:
-    """Normalize URL: drop fragment + common tracking params."""
     if not u:
         return ""
     u = u.split("#", 1)[0].strip()
@@ -128,11 +125,11 @@ def make_fingerprint(url: str, title: str) -> str:
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 def resolve_final_url(session: requests.Session, u: str) -> str:
-    """Resolve redirects (HEAD first, GET stream fallback)."""
     if not u:
         return ""
     u = norm_url(u)
 
+    # HEAD first (faster)
     try:
         r = request_with_retry(session, "HEAD", u, timeout=12, allow_redirects=True)
         if r is not None and getattr(r, "url", None):
@@ -140,6 +137,7 @@ def resolve_final_url(session: requests.Session, u: str) -> str:
     except Exception:
         pass
 
+    # GET stream fallback
     try:
         r = request_with_retry(session, "GET", u, timeout=15, allow_redirects=True, stream=True)
         if r is not None and getattr(r, "url", None):
@@ -149,13 +147,12 @@ def resolve_final_url(session: requests.Session, u: str) -> str:
 
     return u
 
-def fmt_wib(dt_utc: datetime | None) -> str:
+def fmt_wib(dt_utc):
     if not dt_utc:
         return "Unknown"
     return dt_utc.astimezone(WIB).strftime("%Y-%m-%d %H:%M WIB")
 
-def parse_newsapi_datetime(s: str | None) -> datetime | None:
-    # Example: "2026-02-10T07:12:00Z"
+def parse_newsapi_datetime(s: str):
     if not s:
         return None
     try:
@@ -165,13 +162,13 @@ def parse_newsapi_datetime(s: str | None) -> datetime | None:
     except Exception:
         return None
 
-def entry_published_utc(entry) -> datetime | None:
+def entry_published_utc(entry):
     t = entry.get("published_parsed") or entry.get("updated_parsed")
     if not t:
         return None
     return datetime(*t[:6], tzinfo=timezone.utc)
 
-def make_hashtags(title: str, url: str = "") -> list[str]:
+def make_hashtags(title: str, url: str = ""):
     t = (title or "").lower()
     u = (url or "").lower()
 
@@ -254,13 +251,8 @@ def make_hashtags(title: str, url: str = "") -> list[str]:
     return out[:5]
 
 def short_display_url(u: str, max_len: int = 60) -> str:
-    """
-    Visual short link only (domain + truncated path).
-    Full URL tetap dikirim di baris berikutnya agar tetap clickable.
-    """
     if not u:
         return ""
-
     parts = urlsplit(u)
     display = f"{parts.netloc}{parts.path}"
     if parts.query:
@@ -273,6 +265,10 @@ def short_display_url(u: str, max_len: int = 60) -> str:
 # TELEGRAM
 # =========================
 def telegram_send(session: requests.Session, text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     r = request_with_retry(
         session,
@@ -284,7 +280,6 @@ def telegram_send(session: requests.Session, text: str):
     print("Telegram:", r.status_code, (r.text or "")[:140])
 
 def chunk_text(text: str, limit: int = 3500):
-    """Telegram limit 4096; keep buffer."""
     if len(text) <= limit:
         return [text]
     chunks = []
@@ -298,7 +293,7 @@ def chunk_text(text: str, limit: int = 3500):
         chunks.append(cur)
     return chunks
 
-def send_updates_batched(session: requests.Session, updates: list[dict]):
+def send_updates_batched(session: requests.Session, updates):
     if not updates:
         return
     batch = []
@@ -310,7 +305,7 @@ def send_updates_batched(session: requests.Session, updates: list[dict]):
     if batch:
         _send_one_batch(session, batch)
 
-def _send_one_batch(session: requests.Session, batch: list[dict]):
+def _send_one_batch(session: requests.Session, batch):
     lines = ["🛃 BC News Update (latest)"]
 
     for it in batch:
@@ -355,13 +350,19 @@ def fetch_google_news_rss(session: requests.Session, query: str):
     return out
 
 # =========================
-# NEWSAPI
+# NEWSAPI (fixed + debug)
 # =========================
 def fetch_newsapi(session: requests.Session, query: str, cutoff_utc: datetime):
     if not NEWSAPI_KEY:
+        if DEBUG_NEWSAPI:
+            print("NewsAPI skipped: NEWSAPI_KEY empty")
         return []
 
     url = "https://newsapi.org/v2/everything"
+
+    cutoff_str = cutoff_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    to_str = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
     params = {
         "q": query,
         "searchIn": "title,description",
@@ -369,21 +370,32 @@ def fetch_newsapi(session: requests.Session, query: str, cutoff_utc: datetime):
         "pageSize": NEWSAPI_PAGE_SIZE,
         "apiKey": NEWSAPI_KEY,
         "excludeDomains": NEWSAPI_EXCLUDE_DOMAINS,
-        "from": cutoff_utc.isoformat(),
+        "from": cutoff_str,
+        "to": to_str,
     }
     if NEWSAPI_LANGUAGE:
         params["language"] = NEWSAPI_LANGUAGE
 
     r = request_with_retry(session, "GET", url, params=params, timeout=25)
+
+    if DEBUG_NEWSAPI:
+        print("NewsAPI HTTP:", r.status_code)
+        print("NewsAPI URL:", r.url)
+
     try:
         data = r.json()
     except Exception:
-        print("⚠️ NewsAPI non-JSON:", (r.text or "")[:200])
+        if DEBUG_NEWSAPI:
+            print("⚠️ NewsAPI non-JSON body:", (r.text or "")[:400])
         return []
 
     if data.get("status") != "ok":
-        print("⚠️ NewsAPI error:", data)
+        if DEBUG_NEWSAPI:
+            print("⚠️ NewsAPI error payload:", data)
         return []
+
+    if DEBUG_NEWSAPI:
+        print("NewsAPI totalResults:", data.get("totalResults"))
 
     out = []
     for a in data.get("articles", []):
@@ -414,7 +426,7 @@ def main():
         items += fetch_newsapi(session, QUERY_NEWSAPI, cutoff)
 
         # Deduplicate within run by fingerprint (url+title)
-        by_fp: dict[str, dict] = {}
+        by_fp = {}
         for it in items:
             if not it.get("url") and not it.get("title"):
                 continue
@@ -481,6 +493,15 @@ def main():
             f"old_skipped={too_old}, no_date_skipped={no_date}, fetched={len(items)}"
         )
 
+    except Exception as e:
+        # Make failure visible in Actions logs + Telegram (kalau token ada)
+        err = f"❌ BC monitor FAILED: {type(e).__name__}: {e}"
+        print(err)
+        try:
+            telegram_send(session, err)
+        except Exception:
+            pass
+        raise
     finally:
         try:
             con.close()
