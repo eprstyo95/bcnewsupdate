@@ -89,7 +89,19 @@ PRIORITY_KEYWORDS = [
 # =========================
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")  # allow RSS-only
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")         # primary (group)
+TELEGRAM_PRIVATE_CHAT_ID = os.environ.get("TELEGRAM_PRIVATE_CHAT_ID", "")  # your personal DM
+
+# All chat IDs that receive news alerts (auto-built from above)
+TELEGRAM_ALERT_CHATS = list({c for c in [TELEGRAM_CHAT_ID, TELEGRAM_PRIVATE_CHAT_ID] if c})
+
+# Comma-separated list of allowed chat IDs for COMMANDS (private + groups)
+_allowed_raw = os.environ.get("TELEGRAM_ALLOWED_CHATS", "")
+TELEGRAM_ALLOWED_CHATS = {c.strip() for c in _allowed_raw.split(",") if c.strip()}
+if TELEGRAM_CHAT_ID:
+    TELEGRAM_ALLOWED_CHATS.add(TELEGRAM_CHAT_ID)
+if TELEGRAM_PRIVATE_CHAT_ID:
+    TELEGRAM_ALLOWED_CHATS.add(TELEGRAM_PRIVATE_CHAT_ID)
 
 # =========================
 # SENTIMENT ANALYSIS (Free, offline, Indonesian-aware)
@@ -332,6 +344,14 @@ def init_db(con: sqlite3.Connection):
             total_articles INTEGER DEFAULT 0
         )
     """)
+
+    # bot_state table (tracks Telegram polling offset, etc.)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     con.commit()
 
 
@@ -519,12 +539,15 @@ def short_display_url(u: str, max_len: int = 60) -> str:
 # =========================
 # TELEGRAM
 # =========================
-def telegram_send(session, text, reply_markup=None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram skipped: creds empty")
-        return
+# When set, telegram_send replies to this chat only (for bot commands).
+# When None, telegram_send broadcasts to ALL TELEGRAM_ALERT_CHATS.
+_reply_target_chat_id = None
+
+
+def _telegram_send_one(session, chat_id, text, reply_markup=None):
+    """Send a message to a single chat."""
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -535,7 +558,26 @@ def telegram_send(session, text, reply_markup=None):
         session, "POST",
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         timeout=25, json=payload)
-    print("Telegram:", r.status_code, (r.text or "")[:140])
+    print(f"Telegram [{chat_id}]:", r.status_code, (r.text or "")[:120])
+
+
+def telegram_send(session, text, reply_markup=None):
+    """Send message. If replying to a command → single chat. Otherwise → all alert chats."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("⚠️ Telegram skipped: no bot token")
+        return
+
+    if _reply_target_chat_id:
+        # Responding to a bot command → reply only to that chat
+        _telegram_send_one(session, _reply_target_chat_id, text, reply_markup)
+    else:
+        # Normal alert/heartbeat → broadcast to all configured chats
+        targets = TELEGRAM_ALERT_CHATS or ([TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else [])
+        if not targets:
+            print("⚠️ Telegram skipped: no chat IDs configured")
+            return
+        for chat_id in targets:
+            _telegram_send_one(session, chat_id, text, reply_markup)
 
 
 def chunk_text(text: str, limit: int = 3500):
@@ -1000,7 +1042,8 @@ def cmd_stats():
 # =============================================================================
 # COMMAND: EXPORT CSV
 # =============================================================================
-def cmd_export():
+def cmd_export(chat_id_override: str = None):
+    """Export articles to CSV. If chat_id_override, send file to that chat."""
     con = sqlite3.connect(DB_FILE)
     try:
         init_db(con)
@@ -1020,7 +1063,13 @@ def cmd_export():
         print(f"✅ Exported {len(rows)} articles to {EXPORT_CSV_PATH}")
 
         session = build_session()
-        telegram_send(session, f"📁 CSV export: {len(rows)} artikel → <code>{EXPORT_CSV_PATH}</code>")
+        target = chat_id_override or TELEGRAM_CHAT_ID
+        if target and os.path.exists(EXPORT_CSV_PATH):
+            telegram_send_document(session, EXPORT_CSV_PATH,
+                                   caption=f"📁 CSV export: {len(rows)} artikel",
+                                   chat_id=target)
+        else:
+            telegram_send(session, f"📁 CSV export: {len(rows)} artikel → <code>{EXPORT_CSV_PATH}</code>")
 
     except Exception as e:
         print(f"❌ Export FAILED: {type(e).__name__}: {e}")
@@ -1030,11 +1079,291 @@ def cmd_export():
 
 
 # =============================================================================
+# TELEGRAM BOT COMMANDS (via polling)
+# =============================================================================
+TELEGRAM_COMMANDS = {
+    "/start": "Tampilkan bantuan",
+    "/help": "Tampilkan bantuan",
+    "/stats": "Statistik mingguan & bulanan",
+    "/digest": "Rangkuman berita 24 jam terakhir",
+    "/export": "Export semua artikel ke CSV",
+    "/health": "Cek status sumber berita",
+    "/sentiment": "Ringkasan sentimen hari ini",
+}
+
+
+def telegram_get_updates(session: requests.Session, offset: int = None) -> list:
+    """Fetch new messages via Telegram getUpdates (long polling disabled, instant)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": 0, "allowed_updates": '["message"]'}
+    if offset:
+        params["offset"] = offset
+    try:
+        r = request_with_retry(session, "GET", url, params=params, timeout=15)
+        data = r.json()
+        return data.get("result", [])
+    except Exception as e:
+        print(f"⚠️ getUpdates failed: {e}")
+        return []
+
+
+def telegram_send_document(session: requests.Session, filepath: str, caption: str = "",
+                           chat_id: str = None):
+    """Send a file as a Telegram document."""
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
+        print("⚠️ Telegram doc skipped: creds empty")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    try:
+        with open(filepath, "rb") as f:
+            r = request_with_retry(
+                session, "POST", url, timeout=30,
+                data={"chat_id": target, "caption": caption, "parse_mode": "HTML"},
+                files={"document": (os.path.basename(filepath), f)},
+            )
+        print("Telegram doc:", r.status_code, (r.text or "")[:140])
+    except Exception as e:
+        print(f"⚠️ Telegram doc failed: {e}")
+
+
+def get_bot_state(con: sqlite3.Connection, key: str, default: str = "") -> str:
+    cur = con.cursor()
+    cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+    row = cur.fetchone()
+    return row[0] if row else default
+
+
+def set_bot_state(con: sqlite3.Connection, key: str, value: str):
+    con.cursor().execute(
+        "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value))
+    con.commit()
+
+
+def handle_bot_command(session: requests.Session, command: str, chat_id: str, con: sqlite3.Connection):
+    """Process a single bot command and reply to the originating chat."""
+    global _reply_target_chat_id
+    _reply_target_chat_id = chat_id  # route all telegram_send to this chat
+
+    try:
+        cmd = command.strip().lower().split("@")[0]  # strip @botname suffix
+
+        if cmd in ("/start", "/help"):
+            lines = ["🛃 <b>BC News Bot — Commands</b>\n"]
+            for c, desc in TELEGRAM_COMMANDS.items():
+                lines.append(f"  {c} — {desc}")
+            lines.append("\n💡 Bot memeriksa perintah setiap 5 menit.")
+            telegram_send(session, "\n".join(lines))
+
+        elif cmd == "/stats":
+            cmd_stats()
+
+        elif cmd == "/digest":
+            cmd_digest()
+
+        elif cmd == "/export":
+            cmd_export(chat_id_override=chat_id)
+
+        elif cmd == "/health":
+            _handle_health_command(session, con)
+
+        elif cmd == "/sentiment":
+            _handle_sentiment_command(session, con)
+
+        else:
+            telegram_send(session, f"❓ Perintah tidak dikenal: <code>{html.escape(cmd)}</code>\nKetik /help untuk daftar perintah.")
+    finally:
+        _reply_target_chat_id = None  # reset after command
+
+
+def _handle_health_command(session: requests.Session, con: sqlite3.Connection):
+    """Reply with current source health status."""
+    cur = con.cursor()
+    cur.execute("SELECT source_name, consecutive_fails, total_fetches, total_articles, last_success_utc FROM source_health")
+    rows = cur.fetchall()
+
+    if not rows:
+        telegram_send(session, "📡 <b>Source Health</b>\n\nBelum ada data. Jalankan fetch terlebih dahulu.")
+        return
+
+    lines = ["📡 <b>Source Health</b>\n"]
+    for name, fails, tf, ta, last_ok in rows:
+        status = "✅ OK" if fails == 0 else f"⚠️ GAGAL ({fails}x berturut-turut)"
+        avg = round(ta / tf, 1) if tf > 0 else 0
+        last_ok_str = last_ok[:19] if last_ok else "never"
+        lines.append(f"<b>{html.escape(name)}</b>")
+        lines.append(f"  Status: {status}")
+        lines.append(f"  Avg artikel/fetch: {avg}")
+        lines.append(f"  Total fetch: {tf}")
+        lines.append(f"  Last OK: {html.escape(last_ok_str)}")
+        lines.append("")
+    telegram_send(session, "\n".join(lines))
+
+
+def _handle_sentiment_command(session: requests.Session, con: sqlite3.Connection):
+    """Reply with today's sentiment summary."""
+    cur = con.cursor()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label",
+                (cutoff,))
+    counts = dict(cur.fetchall())
+
+    total = sum(counts.values())
+    pos = counts.get("positive", 0)
+    neg = counts.get("negative", 0)
+    neu = counts.get("neutral", 0)
+
+    # Top negative articles
+    cur.execute(
+        "SELECT title, url FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'negative' ORDER BY first_seen_utc DESC LIMIT 5",
+        (cutoff,))
+    neg_articles = cur.fetchall()
+
+    # Top positive articles
+    cur.execute(
+        "SELECT title, url FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'positive' ORDER BY first_seen_utc DESC LIMIT 5",
+        (cutoff,))
+    pos_articles = cur.fetchall()
+
+    lines = [
+        f"📊 <b>Sentimen 24 Jam Terakhir</b>\n",
+        f"Total: <b>{total}</b> artikel",
+        f"🟢 Positif: {pos}  |  🔴 Negatif: {neg}  |  ⚪ Netral: {neu}",
+    ]
+
+    if neg_articles:
+        lines += ["", "🔴 <b>Negatif terbaru:</b>"]
+        for title, url in neg_articles:
+            t = html.escape((title or "")[:70])
+            u = html.escape(url or "")
+            lines.append(f'  • <a href="{u}">{t}</a>')
+
+    if pos_articles:
+        lines += ["", "🟢 <b>Positif terbaru:</b>"]
+        for title, url in pos_articles:
+            t = html.escape((title or "")[:70])
+            u = html.escape(url or "")
+            lines.append(f'  • <a href="{u}">{t}</a>')
+
+    telegram_send(session, "\n".join(lines))
+
+
+def cmd_poll():
+    """Check for new Telegram commands and process them."""
+    session = build_session()
+    con = sqlite3.connect(DB_FILE)
+
+    try:
+        init_db(con)
+        last_offset = int(get_bot_state(con, "tg_update_offset", "0"))
+
+        updates = telegram_get_updates(session, offset=last_offset or None)
+        if not updates:
+            print("Poll: no new messages.")
+            return
+
+        processed = 0
+        for update in updates:
+            update_id = update.get("update_id", 0)
+            msg = update.get("message", {})
+            text = (msg.get("text") or "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+
+            # Security: only respond to allowed chats (private + groups)
+            if chat_id not in TELEGRAM_ALLOWED_CHATS:
+                print(f"Poll: ignoring message from chat {chat_id}")
+                set_bot_state(con, "tg_update_offset", str(update_id + 1))
+                continue
+
+            if text.startswith("/"):
+                print(f"Poll: processing command '{text}' from chat {chat_id}")
+                try:
+                    handle_bot_command(session, text, chat_id, con)
+                except Exception as e:
+                    telegram_send(session, f"❌ Error: <code>{html.escape(str(e)[:200])}</code>")
+                processed += 1
+
+            # Always advance offset
+            set_bot_state(con, "tg_update_offset", str(update_id + 1))
+
+        print(f"Poll: {len(updates)} updates, {processed} commands processed.")
+
+    except Exception as e:
+        print(f"❌ Poll FAILED: {type(e).__name__}: {e}")
+    finally:
+        con.close()
+
+
+# =============================================================================
+# COMMAND: SETUP (register Telegram bot menu)
+# =============================================================================
+def cmd_setup():
+    """Register bot commands with Telegram so the menu appears in chats."""
+    session = build_session()
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN not set.")
+        return
+
+    # Commands to register (excluding /start and /help, Telegram handles those)
+    commands = [
+        {"command": "help", "description": "Tampilkan daftar perintah"},
+        {"command": "stats", "description": "Statistik mingguan & bulanan"},
+        {"command": "digest", "description": "Rangkuman berita 24 jam terakhir"},
+        {"command": "export", "description": "Export semua artikel ke CSV"},
+        {"command": "health", "description": "Cek status sumber berita"},
+        {"command": "sentiment", "description": "Ringkasan sentimen hari ini"},
+    ]
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+
+    # Register for all chats (default scope)
+    try:
+        r = request_with_retry(session, "POST", url, timeout=15,
+                               json={"commands": commands})
+        data = r.json()
+        if data.get("ok"):
+            print("✅ Bot commands registered (all chats).")
+        else:
+            print(f"⚠️ setMyCommands failed: {data}")
+    except Exception as e:
+        print(f"❌ Setup failed: {e}")
+        return
+
+    # Also register specifically for groups
+    try:
+        r = request_with_retry(session, "POST", url, timeout=15,
+                               json={
+                                   "commands": commands,
+                                   "scope": {"type": "all_group_chats"},
+                               })
+        data = r.json()
+        if data.get("ok"):
+            print("✅ Bot commands registered (groups).")
+    except Exception as e:
+        print(f"⚠️ Group menu registration failed: {e}")
+
+    print("\n📋 Menu registered! Your bot now shows these commands:")
+    for c in commands:
+        print(f"  /{c['command']} — {c['description']}")
+    print("\n💡 Users can tap the '/' button or menu icon in Telegram to see them.")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    cmds = {"run": cmd_run, "digest": cmd_digest, "stats": cmd_stats, "export": cmd_export}
+    cmds = {
+        "run": cmd_run,
+        "digest": cmd_digest,
+        "stats": cmd_stats,
+        "export": cmd_export,
+        "poll": cmd_poll,
+        "setup": cmd_setup,
+    }
 
     if cmd in cmds:
         print(f"▶ {cmd}")
