@@ -1,37 +1,29 @@
 name: bcnews 5min
-
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
   push:
     branches: ["main"]
-
 concurrency:
   group: bcnews-${{ github.ref_name }}
   cancel-in-progress: false
-
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      # IMPORTANT: use restore+save so the updated seen.sqlite persists across runs
       - name: Restore seen database cache
         uses: actions/cache/restore@v4
         with:
@@ -41,7 +33,6 @@ jobs:
             seen-db-v2-${{ runner.os }}-${{ github.ref_name }}-
             seen-db-v2-${{ runner.os }}-
             seen-db-v2-
-
       - name: Run bc news update
         env:
           NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
@@ -49,7 +40,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python bc_news_update.py
-
       - name: Save seen database cache
         uses: actions/cache/save@v4
         with:
