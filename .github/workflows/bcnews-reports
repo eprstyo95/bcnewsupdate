@@ -1,0 +1,93 @@
+name: bcnews digest & stats
+on:
+  schedule:
+    # Daily digest: 9 PM WIB = 14:00 UTC
+    - cron: "0 14 * * *"
+    # Weekly stats + CSV export: Monday 8 AM WIB = 01:00 UTC
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Command to run"
+        required: true
+        type: choice
+        options:
+          - digest
+          - stats
+          - export
+          - all
+concurrency:
+  group: bcnews-reports-${{ github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Restore the same DB that the 5-min workflow writes to
+      - name: Restore seen database cache
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.sqlite
+          key: seen-db-v2-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            seen-db-v2-${{ runner.os }}-${{ github.ref_name }}-
+            seen-db-v2-${{ runner.os }}-
+            seen-db-v2-
+
+      # ── Scheduled: daily digest at 14:00 UTC (9 PM WIB) ──
+      - name: Run daily digest
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *')
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'digest' || inputs.command == 'all'))
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python bc_news_update.py digest
+
+      # ── Scheduled: weekly stats on Monday 01:00 UTC (8 AM WIB) ──
+      - name: Run weekly stats
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'stats' || inputs.command == 'all'))
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python bc_news_update.py stats
+
+      # ── CSV export: weekly alongside stats, or on-demand ──
+      - name: Run CSV export
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'export' || inputs.command == 'all'))
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python bc_news_update.py export
+
+      # Upload CSV as downloadable artifact (kept 7 days)
+      - name: Upload CSV artifact
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'export' || inputs.command == 'all'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: bc-articles-export-${{ github.run_id }}
+          path: bc_articles_export.csv
+          retention-days: 7
+          if-no-files-found: warn
