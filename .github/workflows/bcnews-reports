@@ -3,7 +3,7 @@ on:
   schedule:
     # Daily digest: 9 PM WIB = 14:00 UTC
     - cron: "0 14 * * *"
-    # Weekly stats + CSV export: Monday 8 AM WIB = 01:00 UTC
+    # Weekly: leaderboard + stats + report + export — Monday 8 AM WIB = 01:00 UTC
     - cron: "0 1 * * 1"
   workflow_dispatch:
     inputs:
@@ -14,6 +14,8 @@ on:
         options:
           - digest
           - stats
+          - leaderboard
+          - report
           - export
           - all
 concurrency:
@@ -36,7 +38,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore the same DB that the 5-min workflow writes to
       - name: Restore seen database cache
         uses: actions/cache/restore@v4
         with:
@@ -47,7 +48,7 @@ jobs:
             seen-db-v2-${{ runner.os }}-
             seen-db-v2-
 
-      # ── Scheduled: daily digest at 14:00 UTC (9 PM WIB) ──
+      # ── Daily digest (9 PM WIB) ──
       - name: Run daily digest
         if: >-
           (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *')
@@ -56,10 +57,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_PRIVATE_CHAT_ID: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
-        run: |
-          python bc_news_update.py digest
+        run: python bc_news_update.py digest
 
-      # ── Scheduled: weekly stats on Monday 01:00 UTC (8 AM WIB) ──
+      # ── Weekly stats (Monday 8 AM WIB) ──
       - name: Run weekly stats
         if: >-
           (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
@@ -68,10 +68,31 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_PRIVATE_CHAT_ID: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
-        run: |
-          python bc_news_update.py stats
+        run: python bc_news_update.py stats
 
-      # ── CSV export: weekly alongside stats, or on-demand ──
+      # ── Weekly leaderboard ──
+      - name: Run weekly leaderboard
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'leaderboard' || inputs.command == 'all'))
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_PRIVATE_CHAT_ID: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
+        run: python bc_news_update.py leaderboard
+
+      # ── Weekly PDF report ──
+      - name: Run weekly PDF report
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'report' || inputs.command == 'all'))
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_PRIVATE_CHAT_ID: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
+        run: python bc_news_update.py report
+
+      # ── Weekly CSV export ──
       - name: Run CSV export
         if: >-
           (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
@@ -80,17 +101,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_PRIVATE_CHAT_ID: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
-        run: |
-          python bc_news_update.py export
+        run: python bc_news_update.py export
 
-      # Upload CSV as downloadable artifact (kept 7 days)
-      - name: Upload CSV artifact
+      - name: Upload artifacts
         if: >-
           (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
-          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'export' || inputs.command == 'all'))
+          || (github.event_name == 'workflow_dispatch' && (inputs.command == 'export' || inputs.command == 'report' || inputs.command == 'all'))
         uses: actions/upload-artifact@v4
         with:
-          name: bc-articles-export-${{ github.run_id }}
-          path: bc_articles_export.csv
-          retention-days: 7
+          name: bc-weekly-${{ github.run_id }}
+          path: |
+            bc_articles_export.csv
+            bc_weekly_report.pdf
+          retention-days: 14
           if-no-files-found: warn
