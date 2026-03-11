@@ -51,6 +51,29 @@ MAX_AGE_HOURS = 24
 
 GOOGLE_RSS_SIZE = 30
 
+# Direct RSS feeds (faster than Google News aggregation)
+# These are fetched alongside Google News RSS; dedup handles overlaps
+DIRECT_RSS_FEEDS = {
+    "Antara-BC": "https://www.antaranews.com/rss/topik/bea-cukai.xml",
+    "Antara-Ekonomi": "https://www.antaranews.com/rss/ekonomi.xml",
+    "Detik-Finance": "https://rss.detik.com/index.php/finance",
+    "Kompas-Ekonomi": "https://rss.kompas.com/ekonomi",
+    "Bisnis-Ekonomi": "https://www.bisnis.com/rss/ekonomi",
+    "CNBC-ID": "https://www.cnbcindonesia.com/rss",
+    "Kontan": "https://www.kontan.co.id/rss",
+    "Tempo-Bisnis": "https://rss.tempo.co/bisnis",
+}
+
+# Keywords to filter direct RSS articles (must match at least one)
+DIRECT_RSS_KEYWORDS = [
+    "bea cukai", "djbc", "kemenkeu", "kementerian keuangan",
+    "cukai", "kepabeanan", "impor", "ekspor", "tarif",
+    "penyelundupan", "smuggling", "customs",
+    "bea masuk", "penindakan", "penerimaan negara",
+    "kawasan berikat", "plb", "kite",
+    "sri mulyani", "menkeu",
+]
+
 MAX_ITEMS_PER_BATCH = 1
 SEND_HEARTBEAT = True
 
@@ -62,6 +85,10 @@ WIB = timezone(timedelta(hours=7))
 # Trending: alert if a hashtag appears >= this many times in TRENDING_WINDOW_HOURS
 TRENDING_THRESHOLD = 4
 TRENDING_WINDOW_HOURS = 3
+
+# Fuzzy dedup: Jaccard similarity threshold (0.0 - 1.0)
+# Headlines with similarity >= this are considered the same story
+DEDUP_SIMILARITY_THRESHOLD = 0.40
 
 # Export
 EXPORT_CSV_PATH = "bc_articles_export.csv"
@@ -163,6 +190,77 @@ def analyze_sentiment(title: str, description: str = "") -> dict:
     elif score < -0.15:
         return {"label": "Negatif", "emoji": "🔴", "score": round(score, 2)}
     return {"label": "Netral", "emoji": "⚪", "score": round(score, 2)}
+
+
+# =========================
+# FUZZY DUPLICATE DETECTION
+# =========================
+_STOPWORDS = {
+    # Indonesian
+    "dan", "di", "ke", "dari", "yang", "untuk", "dengan", "ini", "itu",
+    "pada", "adalah", "akan", "juga", "atau", "tidak", "oleh", "ada",
+    "bisa", "sudah", "telah", "lebih", "sangat", "saat", "sedang",
+    "secara", "serta", "dalam", "antara", "sebuah", "mereka", "kami",
+    # English
+    "the", "a", "an", "in", "of", "and", "to", "for", "is", "on",
+    "with", "at", "by", "as", "its", "be", "has", "was", "are", "this",
+}
+
+
+def _tokenize(text: str) -> set:
+    """Tokenize text into meaningful words, removing stopwords and short tokens."""
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    return {t for t in text.split() if len(t) > 2 and t not in _STOPWORDS}
+
+
+def jaccard_similarity(title_a: str, title_b: str) -> float:
+    """Calculate Jaccard similarity between two headlines."""
+    set_a = _tokenize(title_a)
+    set_b = _tokenize(title_b)
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+def find_similar_articles(item: dict, other_items: list) -> list:
+    """Find articles with similar headlines (fuzzy dedup)."""
+    title = item.get("title", "")
+    similar = []
+    for other in other_items:
+        if other is item or other.get("url") == item.get("url"):
+            continue
+        sim = jaccard_similarity(title, other.get("title", ""))
+        if sim >= DEDUP_SIMILARITY_THRESHOLD:
+            similar.append({"source": other.get("source", "?"), "similarity": round(sim, 2)})
+    return similar
+
+
+def deduplicate_fuzzy(items: list) -> list:
+    """
+    Remove fuzzy duplicates: keep the first occurrence, mark later ones as dupes.
+    Returns list of unique items with 'also_covered_by' field added.
+    """
+    unique = []
+    seen_titles = []  # (title, index_in_unique)
+
+    for it in items:
+        title = it.get("title", "")
+        is_dupe = False
+
+        for prev_title, idx in seen_titles:
+            sim = jaccard_similarity(title, prev_title)
+            if sim >= DEDUP_SIMILARITY_THRESHOLD:
+                # It's a dupe — add cross-reference to the original
+                src = it.get("source", "?")
+                unique[idx].setdefault("also_covered_by", []).append(src)
+                is_dupe = True
+                break
+
+        if not is_dupe:
+            unique.append(it)
+            seen_titles.append((title, len(unique) - 1))
+
+    return unique
 
 
 # =========================
@@ -644,6 +742,12 @@ def _send_single_article(session, it):
     lines.append(f"{sent_emoji} Sentimen: <b>{sent_label}</b>")
     lines.append(f"🏷️ {tags_h}")
 
+    # Cross-reference: show if other sources also covered this story
+    also_covered = it.get("also_covered_by", [])
+    if also_covered:
+        sources_str = ", ".join(html.escape(s) for s in also_covered[:3])
+        lines.append(f"🔁 <i>Also: {sources_str}</i>")
+
     text = "\n".join(lines)
     buttons = [{"text": "📖 Baca Artikel", "url": url}] if url else []
     if title:
@@ -680,6 +784,52 @@ def fetch_google_news_rss(session, query, language="id"):
     return out
 
 
+# =========================
+# DIRECT RSS FEEDS
+# =========================
+def _matches_direct_keywords(title: str, description: str = "") -> bool:
+    """Check if article matches any BC-related keyword (for filtering general feeds)."""
+    text = f"{title} {description}".lower()
+    return any(kw in text for kw in DIRECT_RSS_KEYWORDS)
+
+
+def fetch_direct_rss(session):
+    """Fetch from all configured direct RSS feeds, filtering by keywords."""
+    all_items = []
+
+    for feed_name, feed_url in DIRECT_RSS_FEEDS.items():
+        try:
+            feed = feedparser.parse(feed_url)
+            count = 0
+            for entry in feed.entries[:30]:
+                title = (entry.get("title") or "").strip()
+                description = (entry.get("summary") or entry.get("description") or "").strip()
+
+                # Filter: only keep articles matching BC keywords
+                if not _matches_direct_keywords(title, description):
+                    continue
+
+                pub = entry_published_utc(entry)
+                link = entry.get("link") or ""
+
+                all_items.append({
+                    "source": feed_name,
+                    "title": title,
+                    "summary": description,
+                    "description": description,
+                    "url": norm_url(link),  # skip resolve for speed on direct feeds
+                    "published_utc": pub,
+                    "language": "id",
+                })
+                count += 1
+
+            print(f"  RSS {feed_name}: {count} matched / {len(feed.entries)} total")
+        except Exception as e:
+            print(f"  ⚠️ RSS {feed_name} failed: {e}")
+
+    return all_items
+
+
 # =============================================================================
 # COMMAND: NORMAL RUN
 # =============================================================================
@@ -692,15 +842,18 @@ def cmd_run():
         now_utc = datetime.now(timezone.utc)
         cutoff = now_utc - timedelta(hours=MAX_AGE_HOURS)
 
-        # Fetch Indonesian sources
+        # Fetch Google News RSS (Indonesian + English)
         rss_id = fetch_google_news_rss(session, QUERY_RSS_ID, language="id")
         record_source_health(con, "GoogleNews-ID", len(rss_id))
 
-        # Fetch English sources
         rss_en = fetch_google_news_rss(session, QUERY_RSS_EN, language="en")
         record_source_health(con, "GoogleNews-EN", len(rss_en))
 
-        items = rss_id + rss_en
+        # Fetch direct RSS feeds
+        direct_items = fetch_direct_rss(session)
+        record_source_health(con, "DirectRSS", len(direct_items))
+
+        items = rss_id + rss_en + direct_items
 
         # Deduplicate by fingerprint
         by_fp = {}
@@ -718,6 +871,11 @@ def cmd_run():
         items = sorted(by_fp.values(),
                        key=lambda x: x.get("published_utc") or datetime.min.replace(tzinfo=timezone.utc),
                        reverse=True)
+
+        # Fuzzy dedup: catch similar headlines across sources
+        pre_fuzzy = len(items)
+        items = deduplicate_fuzzy(items)
+        fuzzy_deduped = pre_fuzzy - len(items)
 
         new_items = []
         too_old = no_date = seen_skip = 0
@@ -774,16 +932,18 @@ def cmd_run():
                 for label, emoji in [("Positif", "🟢"), ("Negatif", "🔴"), ("Netral", "⚪")])
             lang_summary = f"🇮🇩 {lang_counts.get('id', 0)} | 🌐 {lang_counts.get('en', 0)}"
             trend_note = f" | 🔥 Trending: {len(trending)}" if trending else ""
+            dedup_note = f" | 🔁 Dedup: {fuzzy_deduped}" if fuzzy_deduped > 0 else ""
             telegram_send(
                 session,
                 f"✅ BC monitor OK\n"
                 f"📊 New: {len(new_items)} | Seen: {seen_skip} | Old: {too_old} | No-date: {no_date}\n"
                 f"💡 Sentimen: {sent_summary}\n"
-                f"🌍 Bahasa: {lang_summary}{trend_note}\n"
+                f"🌍 Bahasa: {lang_summary}{trend_note}{dedup_note}\n"
+                f"📡 Sources: GNews-ID {len(rss_id)} | GNews-EN {len(rss_en)} | Direct {len(direct_items)}\n"
                 f"⏱️ Window: {MAX_AGE_HOURS}h")
 
         print(f"Done. New={len(new_items)}, seen={seen_skip}, old={too_old}, no_date={no_date}, "
-              f"fetched={len(items)}, lang={lang_counts}, trending={len(trending)}")
+              f"fetched={len(items)}, fuzzy_deduped={fuzzy_deduped}, lang={lang_counts}, trending={len(trending)}")
 
     except Exception as e:
         err = f"❌ BC monitor FAILED: {type(e).__name__}: {e}"
