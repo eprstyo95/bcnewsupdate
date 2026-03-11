@@ -395,6 +395,17 @@ def init_db(con: sqlite3.Connection):
         )
     """)
 
+    # reactions table (article votes from group members)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reactions (
+            fingerprint TEXT,
+            user_id TEXT,
+            reaction TEXT,
+            reacted_utc TEXT,
+            PRIMARY KEY (fingerprint, user_id)
+        )
+    """)
+
     # Cleanup: remove old NewsAPI entries from source_health
     cur.execute("DELETE FROM source_health WHERE source_name LIKE '%NewsAPI%'")
 
@@ -749,12 +760,28 @@ def _send_single_article(session, it):
         lines.append(f"🔁 <i>Also: {sources_str}</i>")
 
     text = "\n".join(lines)
-    buttons = [{"text": "📖 Baca Artikel", "url": url}] if url else []
+
+    # Generate fingerprint for reaction tracking
+    fp = make_fingerprint(url, title)
+
+    # Build inline keyboard: URL buttons on top, reaction buttons below
+    keyboard = []
+    url_row = []
+    if url:
+        url_row.append({"text": "📖 Baca Artikel", "url": url})
     if title:
         search_url = f"https://www.google.com/search?q={quote(title[:80])}"
-        buttons.append({"text": "🔍 Cari Lebih", "url": search_url})
+        url_row.append({"text": "🔍 Cari Lebih", "url": search_url})
+    if url_row:
+        keyboard.append(url_row)
 
-    reply_markup = build_inline_keyboard(buttons) if buttons else None
+    # Reaction row (callback buttons)
+    keyboard.append([
+        {"text": "👍 Relevan", "callback_data": f"react:{fp[:16]}:up"},
+        {"text": "👎 Tidak", "callback_data": f"react:{fp[:16]}:down"},
+    ])
+
+    reply_markup = {"inline_keyboard": keyboard} if keyboard else None
     for part in chunk_text(text):
         telegram_send(session, part, reply_markup=reply_markup)
 
@@ -1545,6 +1572,8 @@ TELEGRAM_COMMANDS = {
     "/leaderboard": "Leaderboard sumber & topik mingguan",
     "/trending": "Topik yang sedang ramai",
     "/sentiment": "Ringkasan sentimen hari ini",
+    "/mediatone": "Tone media per outlet",
+    "/reactions": "Artikel paling banyak di-vote",
     "/export": "Export semua artikel ke CSV",
     "/report": "Buat & kirim laporan PDF mingguan",
     "/health": "Cek status sumber berita",
@@ -1554,7 +1583,7 @@ TELEGRAM_COMMANDS = {
 def telegram_get_updates(session, offset=None):
     if not TELEGRAM_BOT_TOKEN:
         return []
-    params = {"timeout": 0, "allowed_updates": '["message"]'}
+    params = {"timeout": 0, "allowed_updates": '["message","callback_query"]'}
     if offset:
         params["offset"] = offset
     try:
@@ -1565,6 +1594,180 @@ def telegram_get_updates(session, offset=None):
     except Exception as e:
         print(f"⚠️ getUpdates failed: {e}")
         return []
+
+
+# =========================
+# REACTION HANDLING
+# =========================
+def save_reaction(con, fingerprint_short, user_id, reaction):
+    """Save or update a user's reaction. fingerprint_short is first 16 chars."""
+    cur = con.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute("SELECT fingerprint FROM seen WHERE fingerprint LIKE ?", (fingerprint_short + "%",))
+    row = cur.fetchone()
+    fp = row[0] if row else fingerprint_short
+    cur.execute(
+        "INSERT OR REPLACE INTO reactions (fingerprint, user_id, reaction, reacted_utc) VALUES (?, ?, ?, ?)",
+        (fp, str(user_id), reaction, now))
+    con.commit()
+    return fp
+
+
+def get_reaction_counts(con, fingerprint):
+    cur = con.cursor()
+    cur.execute("SELECT reaction, COUNT(*) FROM reactions WHERE fingerprint = ? GROUP BY reaction", (fingerprint,))
+    counts = dict(cur.fetchall())
+    return counts.get("up", 0), counts.get("down", 0)
+
+
+def telegram_answer_callback(session, callback_query_id, text=""):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        request_with_retry(session, "POST",
+                           f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                           timeout=10,
+                           json={"callback_query_id": callback_query_id, "text": text})
+    except Exception:
+        pass
+
+
+def handle_callback_query(session, callback_query, con):
+    """Process a reaction button press."""
+    cb_id = callback_query.get("id", "")
+    data = callback_query.get("data", "")
+    user = callback_query.get("from", {})
+    user_id = str(user.get("id", ""))
+    user_name = user.get("first_name", "User")
+
+    if not data.startswith("react:"):
+        telegram_answer_callback(session, cb_id, "❓")
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3 or parts[2] not in ("up", "down"):
+        telegram_answer_callback(session, cb_id, "❓")
+        return
+
+    _, fp_short, reaction = parts
+    fp = save_reaction(con, fp_short, user_id, reaction)
+    up, down = get_reaction_counts(con, fp)
+
+    emoji = "👍" if reaction == "up" else "👎"
+    telegram_answer_callback(session, cb_id, f"{emoji} Tercatat! (👍 {up} | 👎 {down})")
+    print(f"Reaction: {user_name} voted {reaction} on {fp_short} (👍{up}/👎{down})")
+
+
+# =========================
+# MEDIA TONE TRACKER
+# =========================
+def _handle_mediatone_command(session, con):
+    cur = con.cursor()
+    week_cut = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    cur.execute("""
+        SELECT source, sentiment_label, COUNT(*)
+        FROM seen WHERE first_seen_utc >= ?
+        GROUP BY source, sentiment_label ORDER BY source
+    """, (week_cut,))
+    rows = cur.fetchall()
+
+    if not rows:
+        telegram_send(session, "📊 <b>Media Tone</b>\n\nBelum ada data minggu ini.")
+        return
+
+    sources = {}
+    for src, label, cnt in rows:
+        if src not in sources:
+            sources[src] = {"Positif": 0, "Negatif": 0, "Netral": 0, "total": 0}
+        sources[src][label] = cnt
+        sources[src]["total"] += cnt
+
+    scored = []
+    for src, data in sources.items():
+        if data["total"] < 2:
+            continue
+        tone = (data["Positif"] - data["Negatif"]) / data["total"]
+        scored.append((src, tone, data))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    lines = ["📊 <b>Media Tone Tracker (7 hari)</b>", "",
+             "<i>Skor: +1.0 = selalu positif, -1.0 = selalu negatif</i>", ""]
+
+    if scored:
+        positives = [x for x in scored if x[1] > 0]
+        if positives:
+            lines.append("🟢 <b>Paling Positif:</b>")
+            for src, tone, data in positives[:5]:
+                bar = "🟩" * max(1, int(tone * 5))
+                lines.append(f"  {bar} <b>{html.escape(src[:35])}</b>: {tone:+.2f}")
+                lines.append(f"     {data['Positif']}+ / {data['Negatif']}- / {data['Netral']}○ ({data['total']})")
+
+        negatives = [x for x in scored if x[1] < 0]
+        if negatives:
+            negatives.sort(key=lambda x: x[1])
+            lines += ["", "🔴 <b>Paling Negatif:</b>"]
+            for src, tone, data in negatives[:5]:
+                bar = "🟥" * max(1, int(abs(tone) * 5))
+                lines.append(f"  {bar} <b>{html.escape(src[:35])}</b>: {tone:+.2f}")
+                lines.append(f"     {data['Positif']}+ / {data['Negatif']}- / {data['Netral']}○ ({data['total']})")
+
+        neutrals = [x for x in scored if x[1] == 0]
+        if neutrals:
+            lines += ["", "⚪ <b>Netral:</b>"]
+            for src, tone, data in neutrals[:3]:
+                lines.append(f"  {html.escape(src[:35])}: {data['total']} artikel")
+
+    for part in chunk_text("\n".join(lines), 3500):
+        telegram_send(session, part)
+
+
+# =========================
+# REACTION LEADERBOARD
+# =========================
+def _handle_reactions_command(session, con):
+    cur = con.cursor()
+    cur.execute("""
+        SELECT r.fingerprint, s.title, s.url, s.source,
+               SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END) as ups,
+               SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END) as downs,
+               COUNT(*) as total_votes
+        FROM reactions r LEFT JOIN seen s ON r.fingerprint = s.fingerprint
+        GROUP BY r.fingerprint HAVING total_votes >= 1
+        ORDER BY ups DESC, downs ASC LIMIT 15
+    """)
+    rows = cur.fetchall()
+
+    if not rows:
+        telegram_send(session, "👍 <b>Reactions</b>\n\nBelum ada vote. Tap 👍/👎 di artikel!")
+        return
+
+    most_relevant = [r for r in rows if r[4] > r[5]]
+    least_relevant = sorted([r for r in rows if r[5] > r[4]], key=lambda x: x[5], reverse=True)
+
+    lines = ["👍👎 <b>Article Reactions</b>", ""]
+
+    if most_relevant:
+        lines.append("🏆 <b>Paling Relevan:</b>")
+        for fp, title, url, src, ups, downs, total in most_relevant[:7]:
+            t = html.escape((title or "")[:70])
+            u = html.escape(url or "")
+            lines.append(f'  👍{ups} 👎{downs} — <a href="{u}">{t}</a>')
+            lines.append(f"    <i>{html.escape((src or '')[:25])}</i>")
+
+    if least_relevant:
+        lines += ["", "👎 <b>Kurang Relevan:</b>"]
+        for fp, title, url, src, ups, downs, total in least_relevant[:5]:
+            t = html.escape((title or "")[:70])
+            u = html.escape(url or "")
+            lines.append(f'  👍{ups} 👎{downs} — <a href="{u}">{t}</a>')
+
+    cur.execute("SELECT COUNT(DISTINCT fingerprint), COUNT(*), COUNT(DISTINCT user_id) FROM reactions")
+    art_count, vote_count, voter_count = cur.fetchone()
+    lines += ["", f"📊 {vote_count} votes pada {art_count} artikel dari {voter_count} voters"]
+
+    for part in chunk_text("\n".join(lines), 3500):
+        telegram_send(session, part)
 
 
 def handle_bot_command(session, command, chat_id, con):
@@ -1594,6 +1797,10 @@ def handle_bot_command(session, command, chat_id, con):
             cmd_report()
         elif cmd == "/health":
             _handle_health_command(session, con)
+        elif cmd == "/mediatone":
+            _handle_mediatone_command(session, con)
+        elif cmd == "/reactions":
+            _handle_reactions_command(session, con)
         else:
             telegram_send(session, f"❓ Perintah tidak dikenal: <code>{html.escape(cmd)}</code>\nKetik /help untuk daftar.")
     finally:
@@ -1656,8 +1863,22 @@ def cmd_poll():
             print("Poll: no new messages.")
             return
         processed = 0
+        reactions = 0
         for update in updates:
             update_id = update.get("update_id", 0)
+
+            # Handle callback queries (reaction button presses)
+            cb = update.get("callback_query")
+            if cb:
+                try:
+                    handle_callback_query(session, cb, con)
+                    reactions += 1
+                except Exception as e:
+                    print(f"⚠️ Callback error: {e}")
+                set_bot_state(con, "tg_update_offset", str(update_id + 1))
+                continue
+
+            # Handle text messages (commands)
             msg = update.get("message", {})
             text = (msg.get("text") or "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -1672,7 +1893,7 @@ def cmd_poll():
                     telegram_send(session, f"❌ Error: <code>{html.escape(str(e)[:200])}</code>")
                 processed += 1
             set_bot_state(con, "tg_update_offset", str(update_id + 1))
-        print(f"Poll: {len(updates)} updates, {processed} commands.")
+        print(f"Poll: {len(updates)} updates, {processed} commands, {reactions} reactions.")
     except Exception as e:
         print(f"❌ Poll FAILED: {type(e).__name__}: {e}")
     finally:
@@ -1691,6 +1912,8 @@ def cmd_setup():
         {"command": "leaderboard", "description": "Leaderboard sumber & topik"},
         {"command": "trending", "description": "Topik yang sedang ramai"},
         {"command": "sentiment", "description": "Ringkasan sentimen hari ini"},
+        {"command": "mediatone", "description": "Tone media per outlet"},
+        {"command": "reactions", "description": "Artikel paling banyak di-vote"},
         {"command": "export", "description": "Export artikel ke CSV"},
         {"command": "report", "description": "Laporan PDF mingguan"},
         {"command": "health", "description": "Status sumber berita"},
