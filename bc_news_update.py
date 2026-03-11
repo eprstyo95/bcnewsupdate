@@ -714,6 +714,85 @@ def send_trending_alert(session, trending_topics):
 
 
 # =========================
+# SENTIMENT SHIFT DETECTION
+# =========================
+# Shift detection runs once per day (tracked via bot_state)
+SENTIMENT_SHIFT_THRESHOLD = 0.25  # alert if sentiment ratio shifts by >= 25%
+
+
+def detect_sentiment_shift(con) -> str | None:
+    """
+    Compare this week's sentiment distribution vs last week.
+    Returns alert message string if significant shift detected, else None.
+    Only fires once per day to avoid spam.
+    """
+    # Check if we already sent a shift alert today
+    today_key = f"shift_alert_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    if get_bot_state(con, today_key):
+        return None
+
+    cur = con.cursor()
+    now_utc = datetime.now(timezone.utc)
+    this_week_start = (now_utc - timedelta(days=7)).isoformat()
+    last_week_start = (now_utc - timedelta(days=14)).isoformat()
+
+    # This week
+    cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label",
+                (this_week_start,))
+    tw = dict(cur.fetchall())
+    tw_total = sum(tw.values())
+
+    # Last week
+    cur.execute(
+        "SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc < ? GROUP BY sentiment_label",
+        (last_week_start, this_week_start))
+    lw = dict(cur.fetchall())
+    lw_total = sum(lw.values())
+
+    # Need enough data
+    if tw_total < 5 or lw_total < 5:
+        return None
+
+    # Calculate ratios
+    tw_pos_ratio = tw.get("Positif", 0) / tw_total
+    tw_neg_ratio = tw.get("Negatif", 0) / tw_total
+    lw_pos_ratio = lw.get("Positif", 0) / lw_total
+    lw_neg_ratio = lw.get("Negatif", 0) / lw_total
+
+    pos_shift = tw_pos_ratio - lw_pos_ratio
+    neg_shift = tw_neg_ratio - lw_neg_ratio
+
+    alerts = []
+
+    if abs(neg_shift) >= SENTIMENT_SHIFT_THRESHOLD:
+        if neg_shift > 0:
+            alerts.append(f"🔴 Berita <b>negatif naik signifikan</b>: {lw_neg_ratio:.0%} → {tw_neg_ratio:.0%} (+{neg_shift:.0%})")
+        else:
+            alerts.append(f"🟢 Berita <b>negatif turun signifikan</b>: {lw_neg_ratio:.0%} → {tw_neg_ratio:.0%} ({neg_shift:.0%})")
+
+    if abs(pos_shift) >= SENTIMENT_SHIFT_THRESHOLD:
+        if pos_shift > 0:
+            alerts.append(f"🟢 Berita <b>positif naik signifikan</b>: {lw_pos_ratio:.0%} → {tw_pos_ratio:.0%} (+{pos_shift:.0%})")
+        else:
+            alerts.append(f"🔴 Berita <b>positif turun signifikan</b>: {lw_pos_ratio:.0%} → {tw_pos_ratio:.0%} ({pos_shift:.0%})")
+
+    if not alerts:
+        return None
+
+    # Mark as sent today
+    set_bot_state(con, today_key, "1")
+
+    lines = [
+        "⚠️ <b>Sentiment Shift Alert</b>", "",
+        *alerts, "",
+        f"<b>Minggu ini:</b> 🟢{tw.get('Positif', 0)} 🔴{tw.get('Negatif', 0)} ⚪{tw.get('Netral', 0)} (total {tw_total})",
+        f"<b>Minggu lalu:</b> 🟢{lw.get('Positif', 0)} 🔴{lw.get('Negatif', 0)} ⚪{lw.get('Netral', 0)} (total {lw_total})",
+        "", "💡 Ketik /mediatone untuk detail per outlet."
+    ]
+    return "\n".join(lines)
+
+
+# =========================
 # SEND ARTICLE ALERTS
 # =========================
 def send_updates_batched(session, updates):
@@ -947,6 +1026,11 @@ def cmd_run():
         # Trending detection
         trending = detect_trending(con)
         send_trending_alert(session, trending)
+
+        # Sentiment shift alert (compare today vs 7-day average)
+        shift_alert = detect_sentiment_shift(con)
+        if shift_alert:
+            telegram_send(session, shift_alert)
 
         # Source health alerts
         for alert in check_source_health_alerts(con):
@@ -1574,6 +1658,7 @@ TELEGRAM_COMMANDS = {
     "/sentiment": "Ringkasan sentimen hari ini",
     "/mediatone": "Tone media per outlet",
     "/reactions": "Artikel paling banyak di-vote",
+    "/dashboard": "Update web dashboard",
     "/export": "Export semua artikel ke CSV",
     "/report": "Buat & kirim laporan PDF mingguan",
     "/health": "Cek status sumber berita",
@@ -1801,6 +1886,8 @@ def handle_bot_command(session, command, chat_id, con):
             _handle_mediatone_command(session, con)
         elif cmd == "/reactions":
             _handle_reactions_command(session, con)
+        elif cmd == "/dashboard":
+            cmd_dashboard()
         else:
             telegram_send(session, f"❓ Perintah tidak dikenal: <code>{html.escape(cmd)}</code>\nKetik /help untuk daftar.")
     finally:
@@ -1914,6 +2001,7 @@ def cmd_setup():
         {"command": "sentiment", "description": "Ringkasan sentimen hari ini"},
         {"command": "mediatone", "description": "Tone media per outlet"},
         {"command": "reactions", "description": "Artikel paling banyak di-vote"},
+        {"command": "dashboard", "description": "Update web dashboard"},
         {"command": "export", "description": "Export artikel ke CSV"},
         {"command": "report", "description": "Laporan PDF mingguan"},
         {"command": "health", "description": "Status sumber berita"},
@@ -1937,6 +2025,371 @@ def cmd_setup():
 
 
 # =============================================================================
+# COMMAND: DASHBOARD (static HTML)
+# =============================================================================
+DASHBOARD_HTML_PATH = "docs/index.html"
+
+
+def cmd_dashboard():
+    """Generate a static HTML dashboard with Chart.js from seen.sqlite."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        init_db(con)
+        cur = con.cursor()
+        now_utc = datetime.now(timezone.utc)
+        now_wib = now_utc.astimezone(WIB)
+
+        # ── Daily sentiment (30 days) ──
+        daily_data = []
+        for d in range(29, -1, -1):
+            day = now_utc - timedelta(days=d)
+            ds = day.replace(hour=0, minute=0, second=0).isoformat()
+            de = day.replace(hour=23, minute=59, second=59).isoformat()
+            cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc <= ? GROUP BY sentiment_label", (ds, de))
+            counts = dict(cur.fetchall())
+            daily_data.append({
+                "date": day.strftime("%d/%m"),
+                "Positif": counts.get("Positif", 0),
+                "Negatif": counts.get("Negatif", 0),
+                "Netral": counts.get("Netral", 0),
+            })
+
+        # ── Source breakdown (30 days) ──
+        cur.execute("SELECT source, COUNT(*) c FROM seen WHERE first_seen_utc >= ? GROUP BY source ORDER BY c DESC LIMIT 12",
+                    ((now_utc - timedelta(days=30)).isoformat(),))
+        source_data = [{"source": s, "count": c} for s, c in cur.fetchall()]
+
+        # ── Topic heatmap (7 days x top 10 tags) ──
+        week_cut = (now_utc - timedelta(days=7)).isoformat()
+        cur.execute("SELECT hashtags FROM seen WHERE first_seen_utc >= ?", (week_cut,))
+        tag_counter = Counter()
+        for (t,) in cur.fetchall():
+            for tag in (t or "").split():
+                if tag.startswith("#"):
+                    tag_counter[tag] += 1
+        top_10_tags = [t for t, _ in tag_counter.most_common(10)]
+
+        heatmap_data = []
+        for d in range(6, -1, -1):
+            day = now_utc - timedelta(days=d)
+            ds = day.replace(hour=0, minute=0, second=0).isoformat()
+            de = day.replace(hour=23, minute=59, second=59).isoformat()
+            cur.execute("SELECT hashtags FROM seen WHERE first_seen_utc >= ? AND first_seen_utc <= ?", (ds, de))
+            day_tags = Counter()
+            for (t,) in cur.fetchall():
+                for tag in (t or "").split():
+                    if tag in top_10_tags:
+                        day_tags[tag] += 1
+            row = {"date": day.strftime("%a %d/%m")}
+            for tag in top_10_tags:
+                row[tag] = day_tags.get(tag, 0)
+            heatmap_data.append(row)
+
+        # ── Media tone (7 days) ──
+        cur.execute("""
+            SELECT source, sentiment_label, COUNT(*)
+            FROM seen WHERE first_seen_utc >= ?
+            GROUP BY source, sentiment_label
+        """, (week_cut,))
+        tone_sources = {}
+        for src, label, cnt in cur.fetchall():
+            if src not in tone_sources:
+                tone_sources[src] = {"Positif": 0, "Negatif": 0, "Netral": 0, "total": 0}
+            tone_sources[src][label] = cnt
+            tone_sources[src]["total"] += cnt
+
+        tone_data = []
+        for src, data in tone_sources.items():
+            if data["total"] < 2:
+                continue
+            tone = round((data["Positif"] - data["Negatif"]) / data["total"], 2)
+            tone_data.append({"source": src, "tone": tone, **data})
+        tone_data.sort(key=lambda x: x["tone"], reverse=True)
+        tone_data = tone_data[:12]
+
+        # ── Language split (30 days) ──
+        lang_daily = []
+        for d in range(29, -1, -1):
+            day = now_utc - timedelta(days=d)
+            ds = day.replace(hour=0, minute=0, second=0).isoformat()
+            de = day.replace(hour=23, minute=59, second=59).isoformat()
+            cur.execute("SELECT language, COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc <= ? GROUP BY language", (ds, de))
+            counts = dict(cur.fetchall())
+            lang_daily.append({
+                "date": day.strftime("%d/%m"),
+                "id": counts.get("id", 0),
+                "en": counts.get("en", 0),
+            })
+
+        # ── Summary stats ──
+        month_cut = (now_utc - timedelta(days=30)).isoformat()
+        cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ?", (month_cut,))
+        total_30d = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ?", (week_cut,))
+        total_7d = cur.fetchone()[0]
+        cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label", (week_cut,))
+        wk_sent = dict(cur.fetchall())
+
+        # ── Reactions stats ──
+        cur.execute("""
+            SELECT s.title, s.url,
+                   SUM(CASE WHEN r.reaction='up' THEN 1 ELSE 0 END) ups,
+                   SUM(CASE WHEN r.reaction='down' THEN 1 ELSE 0 END) downs
+            FROM reactions r LEFT JOIN seen s ON r.fingerprint = s.fingerprint
+            GROUP BY r.fingerprint ORDER BY ups DESC LIMIT 10
+        """)
+        reaction_data = [{"title": t or "", "url": u or "", "ups": up, "downs": dn}
+                         for t, u, up, dn in cur.fetchall()]
+
+        # ── Generate HTML ──
+        dashboard_json = json.dumps({
+            "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
+            "summary": {
+                "total_30d": total_30d,
+                "total_7d": total_7d,
+                "positif_7d": wk_sent.get("Positif", 0),
+                "negatif_7d": wk_sent.get("Negatif", 0),
+                "netral_7d": wk_sent.get("Netral", 0),
+            },
+            "daily_sentiment": daily_data,
+            "sources": source_data,
+            "heatmap_tags": top_10_tags,
+            "heatmap": heatmap_data,
+            "tone": tone_data,
+            "lang_daily": lang_daily,
+            "reactions": reaction_data,
+        }, ensure_ascii=False)
+
+        html_content = _build_dashboard_html(dashboard_json)
+
+        os.makedirs(os.path.dirname(DASHBOARD_HTML_PATH) or ".", exist_ok=True)
+        with open(DASHBOARD_HTML_PATH, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        print(f"✅ Dashboard generated: {DASHBOARD_HTML_PATH}")
+
+        session = build_session()
+        telegram_send(session, f"📊 Dashboard updated: {total_7d} articles this week.")
+
+    except Exception as e:
+        err = f"❌ Dashboard FAILED: {type(e).__name__}: {e}"
+        print(err)
+        raise
+    finally:
+        con.close()
+
+
+def _build_dashboard_html(data_json: str) -> str:
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BC News Monitor — Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #0f172a; color: #e2e8f0; padding: 20px; }}
+  .container {{ max-width: 1200px; margin: 0 auto; }}
+  h1 {{ font-size: 1.8rem; margin-bottom: 4px; }}
+  .subtitle {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 16px; }}
+  .card {{ background: #1e293b; border-radius: 12px; padding: 20px; }}
+  .card h2 {{ font-size: 1rem; color: #94a3b8; margin-bottom: 12px; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
+  .stat {{ text-align: center; }}
+  .stat .num {{ font-size: 1.8rem; font-weight: 700; }}
+  .stat .label {{ font-size: 0.75rem; color: #94a3b8; }}
+  .pos {{ color: #4ade80; }} .neg {{ color: #f87171; }} .neu {{ color: #94a3b8; }}
+  canvas {{ max-height: 280px; }}
+  .heatmap {{ display: grid; gap: 2px; font-size: 0.7rem; }}
+  .heatmap-cell {{ padding: 4px; text-align: center; border-radius: 3px; min-width: 30px; }}
+  .heatmap-header {{ font-weight: 600; color: #94a3b8; padding: 4px; text-align: center; }}
+  .tone-bar {{ display: flex; align-items: center; margin: 4px 0; font-size: 0.8rem; }}
+  .tone-bar .bar {{ height: 12px; border-radius: 6px; margin: 0 8px; min-width: 4px; }}
+  .tone-pos {{ background: #4ade80; }} .tone-neg {{ background: #f87171; }}
+  .reaction-item {{ padding: 6px 0; border-bottom: 1px solid #334155; font-size: 0.85rem; }}
+  .reaction-item a {{ color: #60a5fa; text-decoration: none; }}
+  .reaction-item a:hover {{ text-decoration: underline; }}
+  .footer {{ text-align: center; color: #475569; font-size: 0.75rem; margin-top: 30px; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🛃 BC News Monitor</h1>
+  <div class="subtitle" id="generated"></div>
+
+  <!-- Summary Cards -->
+  <div class="grid">
+    <div class="card">
+      <h2>📊 Ringkasan Minggu Ini</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="num" id="total7d">-</div><div class="label">Total</div></div>
+        <div class="stat"><div class="num pos" id="pos7d">-</div><div class="label">Positif</div></div>
+        <div class="stat"><div class="num neg" id="neg7d">-</div><div class="label">Negatif</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>📰 30 Hari Terakhir</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="num" id="total30d">-</div><div class="label">Total Artikel</div></div>
+        <div class="stat"><div class="num neu" id="neu7d">-</div><div class="label">Netral (7d)</div></div>
+        <div class="stat"><div class="num" style="color:#60a5fa" id="avgDaily">-</div><div class="label">Avg/Hari</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Charts Row 1 -->
+  <div class="grid">
+    <div class="card">
+      <h2>📈 Sentimen Harian (30 hari)</h2>
+      <canvas id="sentimentChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>🌍 Bahasa (30 hari)</h2>
+      <canvas id="langChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Charts Row 2 -->
+  <div class="grid">
+    <div class="card">
+      <h2>📰 Top Sumber</h2>
+      <canvas id="sourceChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>📊 Media Tone (7 hari)</h2>
+      <div id="toneContainer"></div>
+    </div>
+  </div>
+
+  <!-- Heatmap -->
+  <div class="card" style="margin-bottom:16px">
+    <h2>🏷️ Topic Heatmap (7 hari)</h2>
+    <div id="heatmapContainer" style="overflow-x:auto"></div>
+  </div>
+
+  <!-- Reactions -->
+  <div class="card" style="margin-bottom:16px">
+    <h2>👍 Top Voted Articles</h2>
+    <div id="reactionsContainer"></div>
+  </div>
+
+  <div class="footer">BC News Monitor — Auto-generated dashboard</div>
+</div>
+
+<script>
+const DATA = {data_json};
+
+// Summary
+document.getElementById('generated').textContent = 'Updated: ' + DATA.generated;
+document.getElementById('total7d').textContent = DATA.summary.total_7d;
+document.getElementById('total30d').textContent = DATA.summary.total_30d;
+document.getElementById('pos7d').textContent = DATA.summary.positif_7d;
+document.getElementById('neg7d').textContent = DATA.summary.negatif_7d;
+document.getElementById('neu7d').textContent = DATA.summary.netral_7d;
+document.getElementById('avgDaily').textContent = (DATA.summary.total_30d / 30).toFixed(1);
+
+// Chart defaults
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#334155';
+
+// Sentiment Line Chart
+new Chart(document.getElementById('sentimentChart'), {{
+  type: 'line',
+  data: {{
+    labels: DATA.daily_sentiment.map(d => d.date),
+    datasets: [
+      {{ label: 'Positif', data: DATA.daily_sentiment.map(d => d.Positif),
+         borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', fill: true, tension: 0.3 }},
+      {{ label: 'Negatif', data: DATA.daily_sentiment.map(d => d.Negatif),
+         borderColor: '#f87171', backgroundColor: 'rgba(248,113,113,0.1)', fill: true, tension: 0.3 }},
+      {{ label: 'Netral', data: DATA.daily_sentiment.map(d => d.Netral),
+         borderColor: '#94a3b8', backgroundColor: 'rgba(148,163,184,0.05)', fill: true, tension: 0.3 }},
+    ]
+  }},
+  options: {{ responsive: true, plugins: {{ legend: {{ position: 'bottom' }} }},
+    scales: {{ x: {{ ticks: {{ maxTicksLimit: 10 }} }}, y: {{ beginAtZero: true }} }} }}
+}});
+
+// Language Chart
+new Chart(document.getElementById('langChart'), {{
+  type: 'bar',
+  data: {{
+    labels: DATA.lang_daily.map(d => d.date),
+    datasets: [
+      {{ label: 'Indonesia', data: DATA.lang_daily.map(d => d.id), backgroundColor: '#ef4444' }},
+      {{ label: 'English', data: DATA.lang_daily.map(d => d.en), backgroundColor: '#3b82f6' }},
+    ]
+  }},
+  options: {{ responsive: true, plugins: {{ legend: {{ position: 'bottom' }} }},
+    scales: {{ x: {{ stacked: true, ticks: {{ maxTicksLimit: 10 }} }}, y: {{ stacked: true, beginAtZero: true }} }} }}
+}});
+
+// Source Bar Chart
+new Chart(document.getElementById('sourceChart'), {{
+  type: 'bar',
+  data: {{
+    labels: DATA.sources.map(d => d.source.length > 25 ? d.source.slice(0,25) + '...' : d.source),
+    datasets: [{{ label: 'Artikel', data: DATA.sources.map(d => d.count),
+      backgroundColor: '#6366f1' }}]
+  }},
+  options: {{ responsive: true, indexAxis: 'y', plugins: {{ legend: {{ display: false }} }},
+    scales: {{ x: {{ beginAtZero: true }} }} }}
+}});
+
+// Media Tone
+const toneEl = document.getElementById('toneContainer');
+DATA.tone.forEach(d => {{
+  const maxBar = 120;
+  const barW = Math.max(4, Math.abs(d.tone) * maxBar);
+  const cls = d.tone >= 0 ? 'tone-pos' : 'tone-neg';
+  const sign = d.tone >= 0 ? '+' : '';
+  toneEl.innerHTML += '<div class="tone-bar">' +
+    '<span style="min-width:140px;display:inline-block">' + d.source.slice(0,30) + '</span>' +
+    '<div class="bar ' + cls + '" style="width:' + barW + 'px"></div>' +
+    '<span>' + sign + d.tone.toFixed(2) + ' (' + d.total + ')</span></div>';
+}});
+if (!DATA.tone.length) toneEl.innerHTML = '<div style="color:#475569">Belum ada data</div>';
+
+// Heatmap
+const hmEl = document.getElementById('heatmapContainer');
+if (DATA.heatmap_tags.length && DATA.heatmap.length) {{
+  const cols = DATA.heatmap_tags.length + 1;
+  let grid = '<div class="heatmap" style="grid-template-columns: 70px repeat(' + (cols-1) + ', 1fr)">';
+  grid += '<div class="heatmap-header"></div>';
+  DATA.heatmap_tags.forEach(t => {{ grid += '<div class="heatmap-header">' + t + '</div>'; }});
+  DATA.heatmap.forEach(row => {{
+    grid += '<div class="heatmap-header">' + row.date + '</div>';
+    DATA.heatmap_tags.forEach(tag => {{
+      const v = row[tag] || 0;
+      const opacity = v === 0 ? 0.05 : Math.min(0.2 + v * 0.15, 1);
+      grid += '<div class="heatmap-cell" style="background:rgba(99,102,241,' + opacity + ')">' + (v || '') + '</div>';
+    }});
+  }});
+  grid += '</div>';
+  hmEl.innerHTML = grid;
+}} else {{
+  hmEl.innerHTML = '<div style="color:#475569">Belum ada data</div>';
+}}
+
+// Reactions
+const rxEl = document.getElementById('reactionsContainer');
+if (DATA.reactions.length) {{
+  DATA.reactions.forEach(r => {{
+    rxEl.innerHTML += '<div class="reaction-item">👍' + r.ups + ' 👎' + r.downs +
+      ' — <a href="' + r.url + '" target="_blank">' + r.title.slice(0, 80) + '</a></div>';
+  }});
+}} else {{
+  rxEl.innerHTML = '<div style="color:#475569">Belum ada vote</div>';
+}}
+</script>
+</body>
+</html>'''
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main():
@@ -1948,6 +2401,7 @@ def main():
         "leaderboard": cmd_leaderboard,
         "export": cmd_export,
         "report": cmd_report,
+        "dashboard": cmd_dashboard,
         "poll": cmd_poll,
         "setup": cmd_setup,
     }
