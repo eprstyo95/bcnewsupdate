@@ -2251,6 +2251,24 @@ def cmd_dashboard():
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Negatif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
         top_negative = [{"title": t, "url": u, "source": s} for t, u, s, _ in cur.fetchall()]
 
+        # ── Recent headlines (all, last 50) ──
+        cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
+                       FROM seen WHERE first_seen_utc >= ? AND title != ''
+                       ORDER BY first_seen_utc DESC LIMIT 50""", (week_cut,))
+        recent_articles = []
+        for title, url, source, sent, seen_utc, tags, lang in cur.fetchall():
+            # Format time to WIB
+            try:
+                dt = datetime.fromisoformat(seen_utc).astimezone(WIB)
+                time_str = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                time_str = ""
+            recent_articles.append({
+                "title": title or "", "url": url or "", "source": source or "",
+                "sentiment": sent or "Netral", "time": time_str,
+                "tags": (tags or "").split()[:3], "lang": lang or "id",
+            })
+
         # ── Generate HTML ──
         dashboard_json = json.dumps({
             "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
@@ -2276,6 +2294,7 @@ def cmd_dashboard():
             "reactions": reaction_data,
             "top_positive": top_positive,
             "top_negative": top_negative,
+            "recent": recent_articles,
         }, ensure_ascii=False)
 
         html_content = _build_dashboard_html(dashboard_json)
@@ -2357,6 +2376,26 @@ def _build_dashboard_html(data_json: str) -> str:
   .reaction-votes {{ color: #94a3b8; font-size: 0.75rem; white-space: nowrap; }}
   .footer {{ text-align: center; color: #334155; font-size: 0.7rem; margin-top: 28px; padding: 12px;
              border-top: 1px solid #1e293b; }}
+  /* Headlines feed */
+  .feed-controls {{ display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }}
+  .feed-btn {{ background: #1e293b; border: 1px solid #1e3a5f; border-radius: 20px; color: #94a3b8;
+               padding: 6px 14px; font-size: 0.75rem; cursor: pointer; font-family: inherit;
+               transition: all 0.2s; }}
+  .feed-btn:hover {{ border-color: #3b82f6; color: #e2e8f0; }}
+  .feed-btn.active {{ background: #3b82f6; border-color: #3b82f6; color: #fff; }}
+  .headline {{ padding: 12px 0; border-bottom: 1px solid #1e3a5f; }}
+  .headline:last-child {{ border-bottom: none; }}
+  .headline-top {{ display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }}
+  .headline-dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }}
+  .headline a {{ color: #e2e8f0; text-decoration: none; font-size: 0.88rem; font-weight: 500;
+                 line-height: 1.4; }}
+  .headline a:hover {{ color: #93c5fd; text-decoration: underline; }}
+  .headline-meta {{ display: flex; gap: 10px; font-size: 0.7rem; color: #64748b; margin-left: 16px;
+                    flex-wrap: wrap; align-items: center; }}
+  .headline-tag {{ background: #1e3a5f; color: #93c5fd; padding: 1px 7px; border-radius: 10px;
+                   font-size: 0.65rem; }}
+  .feed-empty {{ color: #334155; padding: 20px; text-align: center; }}
+  .feed-count {{ color: #64748b; font-size: 0.75rem; margin-left: auto; }}
   @media (max-width: 700px) {{
     .stat .num {{ font-size: 1.5rem; }}
     .grid {{ grid-template-columns: 1fr; }}
@@ -2433,6 +2472,21 @@ def _build_dashboard_html(data_json: str) -> str:
   <div class="card" style="margin-bottom:14px">
     <h2>🏷️ Topic Heatmap (7 hari)</h2>
     <div id="heatmapContainer" style="overflow-x:auto"></div>
+  </div>
+
+  <!-- Headlines Feed -->
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+      <h2 style="margin-bottom:0">📰 Berita Terbaru</h2>
+      <span class="feed-count" id="feedCount"></span>
+    </div>
+    <div class="feed-controls">
+      <button class="feed-btn active" onclick="filterFeed('all')">Semua</button>
+      <button class="feed-btn" onclick="filterFeed('Positif')">🟢 Positif</button>
+      <button class="feed-btn" onclick="filterFeed('Negatif')">🔴 Negatif</button>
+      <button class="feed-btn" onclick="filterFeed('Netral')">⚪ Netral</button>
+    </div>
+    <div id="feedContainer"></div>
   </div>
 
   <!-- Articles Row -->
@@ -2605,6 +2659,50 @@ if (D.reactions.length) {{
 }} else {{
   rxEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada vote — tap 👍/👎 di Telegram</div>';
 }}
+
+// Headlines Feed
+const sentDotColor = {{'Positif': '#4ade80', 'Negatif': '#f87171', 'Netral': '#64748b'}};
+let currentFilter = 'all';
+
+function renderFeed(filter) {{
+  const el = document.getElementById('feedContainer');
+  const countEl = document.getElementById('feedCount');
+  const articles = filter === 'all' ? D.recent : D.recent.filter(a => a.sentiment === filter);
+
+  countEl.textContent = articles.length + ' artikel';
+
+  if (!articles.length) {{
+    el.innerHTML = '<div class="feed-empty">Tidak ada artikel untuk filter ini</div>';
+    return;
+  }}
+
+  el.innerHTML = articles.map(a => {{
+    const dot = sentDotColor[a.sentiment] || '#64748b';
+    const flag = a.lang === 'en' ? '🌐' : '';
+    const tags = (a.tags || []).map(t => '<span class="headline-tag">' + t + '</span>').join(' ');
+    return '<div class="headline">' +
+      '<div class="headline-top">' +
+        '<div class="headline-dot" style="background:' + dot + '"></div>' +
+        '<a href="' + a.url + '" target="_blank">' + a.title.slice(0, 120) + '</a>' +
+      '</div>' +
+      '<div class="headline-meta">' +
+        '<span>📌 ' + a.source.slice(0, 25) + '</span>' +
+        '<span>🕒 ' + a.time + '</span>' +
+        (flag ? '<span>' + flag + '</span>' : '') +
+        tags +
+      '</div>' +
+    '</div>';
+  }}).join('');
+}}
+
+function filterFeed(filter) {{
+  currentFilter = filter;
+  document.querySelectorAll('.feed-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  renderFeed(filter);
+}}
+
+renderFeed('all');
 </script>
 </body>
 </html>'''
