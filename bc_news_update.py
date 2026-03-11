@@ -296,6 +296,10 @@ def init_db(con: sqlite3.Connection):
             value TEXT
         )
     """)
+
+    # Cleanup: remove old NewsAPI entries from source_health
+    cur.execute("DELETE FROM source_health WHERE source_name LIKE '%NewsAPI%'")
+
     con.commit()
 
 
