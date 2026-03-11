@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BC News Monitor — Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #0f172a; color: #e2e8f0; padding: 20px; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin-bottom: 4px; }
+  .subtitle { color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 20px; }
+  .card h2 { font-size: 1rem; color: #94a3b8; margin-bottom: 12px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .stat { text-align: center; }
+  .stat .num { font-size: 1.8rem; font-weight: 700; }
+  .stat .label { font-size: 0.75rem; color: #94a3b8; }
+  .pos { color: #4ade80; } .neg { color: #f87171; } .neu { color: #94a3b8; }
+  canvas { max-height: 280px; }
+  .heatmap { display: grid; gap: 2px; font-size: 0.7rem; }
+  .heatmap-cell { padding: 4px; text-align: center; border-radius: 3px; min-width: 30px; }
+  .heatmap-header { font-weight: 600; color: #94a3b8; padding: 4px; text-align: center; }
+  .tone-bar { display: flex; align-items: center; margin: 4px 0; font-size: 0.8rem; }
+  .tone-bar .bar { height: 12px; border-radius: 6px; margin: 0 8px; min-width: 4px; }
+  .tone-pos { background: #4ade80; } .tone-neg { background: #f87171; }
+  .reaction-item { padding: 6px 0; border-bottom: 1px solid #334155; font-size: 0.85rem; }
+  .reaction-item a { color: #60a5fa; text-decoration: none; }
+  .reaction-item a:hover { text-decoration: underline; }
+  .footer { text-align: center; color: #475569; font-size: 0.75rem; margin-top: 30px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🛃 BC News Monitor</h1>
+  <div class="subtitle" id="generated"></div>
+
+  <!-- Summary Cards -->
+  <div class="grid">
+    <div class="card">
+      <h2>📊 Ringkasan Minggu Ini</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="num" id="total7d">-</div><div class="label">Total</div></div>
+        <div class="stat"><div class="num pos" id="pos7d">-</div><div class="label">Positif</div></div>
+        <div class="stat"><div class="num neg" id="neg7d">-</div><div class="label">Negatif</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>📰 30 Hari Terakhir</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="num" id="total30d">-</div><div class="label">Total Artikel</div></div>
+        <div class="stat"><div class="num neu" id="neu7d">-</div><div class="label">Netral (7d)</div></div>
+        <div class="stat"><div class="num" style="color:#60a5fa" id="avgDaily">-</div><div class="label">Avg/Hari</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Charts Row 1 -->
+  <div class="grid">
+    <div class="card">
+      <h2>📈 Sentimen Harian (30 hari)</h2>
+      <canvas id="sentimentChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>🌍 Bahasa (30 hari)</h2>
+      <canvas id="langChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Charts Row 2 -->
+  <div class="grid">
+    <div class="card">
+      <h2>📰 Top Sumber</h2>
+      <canvas id="sourceChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>📊 Media Tone (7 hari)</h2>
+      <div id="toneContainer"></div>
+    </div>
+  </div>
+
+  <!-- Heatmap -->
+  <div class="card" style="margin-bottom:16px">
+    <h2>🏷️ Topic Heatmap (7 hari)</h2>
+    <div id="heatmapContainer" style="overflow-x:auto"></div>
+  </div>
+
+  <!-- Reactions -->
+  <div class="card" style="margin-bottom:16px">
+    <h2>👍 Top Voted Articles</h2>
+    <div id="reactionsContainer"></div>
+  </div>
+
+  <div class="footer">BC News Monitor — Auto-generated dashboard</div>
+</div>
+
+<script>
+const DATA = {"generated": "11 Mar 2026 15:40 WIB", "summary": {"total_30d": 1177, "total_7d": 586, "positif_7d": 43, "negatif_7d": 17, "netral_7d": 135}, "daily_sentiment": [{"date": "10/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "11/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "12/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "13/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "14/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "15/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "16/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "17/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "18/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "19/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "20/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "21/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "22/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "23/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "24/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "25/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "26/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "27/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "28/02", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "01/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "02/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "03/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "04/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "05/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "06/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "07/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "08/03", "Positif": 0, "Negatif": 0, "Netral": 0}, {"date": "09/03", "Positif": 5, "Negatif": 7, "Netral": 7}, {"date": "10/03", "Positif": 27, "Negatif": 9, "Netral": 75}, {"date": "11/03", "Positif": 11, "Negatif": 1, "Netral": 53}], "sources": [{"source": "", "count": 980}, {"source": "GoogleNews-ID", "count": 188}, {"source": "Tempo-Bisnis", "count": 4}, {"source": "GoogleNews-EN", "count": 3}, {"source": "GoogleNews", "count": 2}], "heatmap_tags": ["#DJBC", "#Cukai", "#Purbaya", "#KawasanBerikat", "#Kemenkeu", "#Penyelundupan", "#Impor", "#PenerimaanNegara", "#Pengawasan", "#RokokIlegal"], "heatmap": [{"date": "Thu 05/03", "#DJBC": 0, "#Cukai": 0, "#Purbaya": 0, "#KawasanBerikat": 0, "#Kemenkeu": 0, "#Penyelundupan": 0, "#Impor": 0, "#PenerimaanNegara": 0, "#Pengawasan": 0, "#RokokIlegal": 0}, {"date": "Fri 06/03", "#DJBC": 0, "#Cukai": 0, "#Purbaya": 0, "#KawasanBerikat": 0, "#Kemenkeu": 0, "#Penyelundupan": 0, "#Impor": 0, "#PenerimaanNegara": 0, "#Pengawasan": 0, "#RokokIlegal": 0}, {"date": "Sat 07/03", "#DJBC": 0, "#Cukai": 0, "#Purbaya": 0, "#KawasanBerikat": 0, "#Kemenkeu": 0, "#Penyelundupan": 0, "#Impor": 0, "#PenerimaanNegara": 0, "#Pengawasan": 0, "#RokokIlegal": 0}, {"date": "Sun 08/03", "#DJBC": 0, "#Cukai": 0, "#Purbaya": 0, "#KawasanBerikat": 0, "#Kemenkeu": 0, "#Penyelundupan": 0, "#Impor": 0, "#PenerimaanNegara": 0, "#Pengawasan": 0, "#RokokIlegal": 0}, {"date": "Mon 09/03", "#DJBC": 17, "#Cukai": 17, "#Purbaya": 0, "#KawasanBerikat": 2, "#Kemenkeu": 0, "#Penyelundupan": 5, "#Impor": 9, "#PenerimaanNegara": 0, "#Pengawasan": 0, "#RokokIlegal": 4}, {"date": "Tue 10/03", "#DJBC": 87, "#Cukai": 80, "#Purbaya": 38, "#KawasanBerikat": 16, "#Kemenkeu": 19, "#Penyelundupan": 13, "#Impor": 6, "#PenerimaanNegara": 18, "#Pengawasan": 7, "#RokokIlegal": 8}, {"date": "Wed 11/03", "#DJBC": 41, "#Cukai": 40, "#Purbaya": 20, "#KawasanBerikat": 13, "#Kemenkeu": 10, "#Penyelundupan": 6, "#Impor": 7, "#PenerimaanNegara": 4, "#Pengawasan": 11, "#RokokIlegal": 4}], "tone": [{"source": "GoogleNews-ID", "tone": 0.14, "Positif": 43, "Negatif": 17, "Netral": 128, "total": 188}, {"source": "", "tone": 0.0, "Positif": 0, "Negatif": 0, "Netral": 0, "total": 389, "": 389}, {"source": "GoogleNews", "tone": 0.0, "Positif": 0, "Negatif": 0, "Netral": 0, "total": 2, "negative": 1, "neutral": 1}, {"source": "GoogleNews-EN", "tone": 0.0, "Positif": 0, "Negatif": 0, "Netral": 3, "total": 3}, {"source": "Tempo-Bisnis", "tone": 0.0, "Positif": 0, "Negatif": 0, "Netral": 4, "total": 4}], "lang_daily": [{"date": "10/02", "id": 0, "en": 0}, {"date": "11/02", "id": 0, "en": 0}, {"date": "12/02", "id": 0, "en": 0}, {"date": "13/02", "id": 0, "en": 0}, {"date": "14/02", "id": 0, "en": 0}, {"date": "15/02", "id": 0, "en": 0}, {"date": "16/02", "id": 0, "en": 0}, {"date": "17/02", "id": 0, "en": 0}, {"date": "18/02", "id": 0, "en": 0}, {"date": "19/02", "id": 0, "en": 0}, {"date": "20/02", "id": 0, "en": 0}, {"date": "21/02", "id": 0, "en": 0}, {"date": "22/02", "id": 0, "en": 0}, {"date": "23/02", "id": 0, "en": 0}, {"date": "24/02", "id": 0, "en": 0}, {"date": "25/02", "id": 0, "en": 0}, {"date": "26/02", "id": 81, "en": 0}, {"date": "27/02", "id": 161, "en": 0}, {"date": "28/02", "id": 95, "en": 0}, {"date": "01/03", "id": 48, "en": 0}, {"date": "02/03", "id": 100, "en": 0}, {"date": "03/03", "id": 66, "en": 0}, {"date": "04/03", "id": 90, "en": 0}, {"date": "05/03", "id": 105, "en": 0}, {"date": "06/03", "id": 75, "en": 0}, {"date": "07/03", "id": 62, "en": 0}, {"date": "08/03", "id": 61, "en": 0}, {"date": "09/03", "id": 56, "en": 1}, {"date": "10/03", "id": 109, "en": 2}, {"date": "11/03", "id": 65, "en": 0}], "reactions": []};
+
+// Summary
+document.getElementById('generated').textContent = 'Updated: ' + DATA.generated;
+document.getElementById('total7d').textContent = DATA.summary.total_7d;
+document.getElementById('total30d').textContent = DATA.summary.total_30d;
+document.getElementById('pos7d').textContent = DATA.summary.positif_7d;
+document.getElementById('neg7d').textContent = DATA.summary.negatif_7d;
+document.getElementById('neu7d').textContent = DATA.summary.netral_7d;
+document.getElementById('avgDaily').textContent = (DATA.summary.total_30d / 30).toFixed(1);
+
+// Chart defaults
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#334155';
+
+// Sentiment Line Chart
+new Chart(document.getElementById('sentimentChart'), {
+  type: 'line',
+  data: {
+    labels: DATA.daily_sentiment.map(d => d.date),
+    datasets: [
+      { label: 'Positif', data: DATA.daily_sentiment.map(d => d.Positif),
+         borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', fill: true, tension: 0.3 },
+      { label: 'Negatif', data: DATA.daily_sentiment.map(d => d.Negatif),
+         borderColor: '#f87171', backgroundColor: 'rgba(248,113,113,0.1)', fill: true, tension: 0.3 },
+      { label: 'Netral', data: DATA.daily_sentiment.map(d => d.Netral),
+         borderColor: '#94a3b8', backgroundColor: 'rgba(148,163,184,0.05)', fill: true, tension: 0.3 },
+    ]
+  },
+  options: { responsive: true, plugins: { legend: { position: 'bottom' } },
+    scales: { x: { ticks: { maxTicksLimit: 10 } }, y: { beginAtZero: true } } }
+});
+
+// Language Chart
+new Chart(document.getElementById('langChart'), {
+  type: 'bar',
+  data: {
+    labels: DATA.lang_daily.map(d => d.date),
+    datasets: [
+      { label: 'Indonesia', data: DATA.lang_daily.map(d => d.id), backgroundColor: '#ef4444' },
+      { label: 'English', data: DATA.lang_daily.map(d => d.en), backgroundColor: '#3b82f6' },
+    ]
+  },
+  options: { responsive: true, plugins: { legend: { position: 'bottom' } },
+    scales: { x: { stacked: true, ticks: { maxTicksLimit: 10 } }, y: { stacked: true, beginAtZero: true } } }
+});
+
+// Source Bar Chart
+new Chart(document.getElementById('sourceChart'), {
+  type: 'bar',
+  data: {
+    labels: DATA.sources.map(d => d.source.length > 25 ? d.source.slice(0,25) + '...' : d.source),
+    datasets: [{ label: 'Artikel', data: DATA.sources.map(d => d.count),
+      backgroundColor: '#6366f1' }]
+  },
+  options: { responsive: true, indexAxis: 'y', plugins: { legend: { display: false } },
+    scales: { x: { beginAtZero: true } } }
+});
+
+// Media Tone
+const toneEl = document.getElementById('toneContainer');
+DATA.tone.forEach(d => {
+  const maxBar = 120;
+  const barW = Math.max(4, Math.abs(d.tone) * maxBar);
+  const cls = d.tone >= 0 ? 'tone-pos' : 'tone-neg';
+  const sign = d.tone >= 0 ? '+' : '';
+  toneEl.innerHTML += '<div class="tone-bar">' +
+    '<span style="min-width:140px;display:inline-block">' + d.source.slice(0,30) + '</span>' +
+    '<div class="bar ' + cls + '" style="width:' + barW + 'px"></div>' +
+    '<span>' + sign + d.tone.toFixed(2) + ' (' + d.total + ')</span></div>';
+});
+if (!DATA.tone.length) toneEl.innerHTML = '<div style="color:#475569">Belum ada data</div>';
+
+// Heatmap
+const hmEl = document.getElementById('heatmapContainer');
+if (DATA.heatmap_tags.length && DATA.heatmap.length) {
+  const cols = DATA.heatmap_tags.length + 1;
+  let grid = '<div class="heatmap" style="grid-template-columns: 70px repeat(' + (cols-1) + ', 1fr)">';
+  grid += '<div class="heatmap-header"></div>';
+  DATA.heatmap_tags.forEach(t => { grid += '<div class="heatmap-header">' + t + '</div>'; });
+  DATA.heatmap.forEach(row => {
+    grid += '<div class="heatmap-header">' + row.date + '</div>';
+    DATA.heatmap_tags.forEach(tag => {
+      const v = row[tag] || 0;
+      const opacity = v === 0 ? 0.05 : Math.min(0.2 + v * 0.15, 1);
+      grid += '<div class="heatmap-cell" style="background:rgba(99,102,241,' + opacity + ')">' + (v || '') + '</div>';
+    });
+  });
+  grid += '</div>';
+  hmEl.innerHTML = grid;
+} else {
+  hmEl.innerHTML = '<div style="color:#475569">Belum ada data</div>';
+}
+
+// Reactions
+const rxEl = document.getElementById('reactionsContainer');
+if (DATA.reactions.length) {
+  DATA.reactions.forEach(r => {
+    rxEl.innerHTML += '<div class="reaction-item">👍' + r.ups + ' 👎' + r.downs +
+      ' — <a href="' + r.url + '" target="_blank">' + r.title.slice(0, 80) + '</a></div>';
+  });
+} else {
+  rxEl.innerHTML = '<div style="color:#475569">Belum ada vote</div>';
+}
+</script>
+</body>
+</html>
