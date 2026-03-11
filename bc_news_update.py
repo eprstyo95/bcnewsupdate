@@ -1374,6 +1374,97 @@ def cmd_leaderboard():
 
 
 # =============================================================================
+# COMMAND: BACKFILL (re-process old articles)
+# =============================================================================
+def _infer_source_from_url(url: str) -> str:
+    """Try to guess source name from URL domain."""
+    if not url:
+        return ""
+    domain = urlsplit(url).netloc.lower()
+    domain_map = {
+        "detik.com": "Detik", "finance.detik.com": "Detik-Finance",
+        "kompas.com": "Kompas", "money.kompas.com": "Kompas-Ekonomi",
+        "cnbcindonesia.com": "CNBC-ID", "bisnis.com": "Bisnis",
+        "kontan.co.id": "Kontan", "tempo.co": "Tempo",
+        "antaranews.com": "Antara", "liputan6.com": "Liputan6",
+        "tribunnews.com": "Tribun", "cnnindonesia.com": "CNN-ID",
+        "republika.co.id": "Republika", "mediaindonesia.com": "MediaIndonesia",
+        "jawapos.com": "JawaPos", "suara.com": "Suara",
+        "kumparan.com": "Kumparan", "merdeka.com": "Merdeka",
+        "okezone.com": "Okezone", "sindonews.com": "SindoNews",
+        "idntimes.com": "IDNTimes", "viva.co.id": "Viva",
+        "reuters.com": "Reuters", "bloomberg.com": "Bloomberg",
+    }
+    for key, name in domain_map.items():
+        if key in domain:
+            return name
+    # Fallback: use domain without TLD
+    parts = domain.replace("www.", "").split(".")
+    return parts[0].capitalize() if parts else ""
+
+
+def cmd_backfill():
+    """Re-process old articles: fill in missing source, sentiment, hashtags."""
+    con = sqlite3.connect(DB_FILE)
+    session = build_session()
+    try:
+        init_db(con)
+        cur = con.cursor()
+
+        # Find articles missing data
+        cur.execute("""SELECT fingerprint, url, title, summary, source, sentiment_label, hashtags
+                       FROM seen WHERE source = '' OR sentiment_label = '' OR hashtags = ''""")
+        rows = cur.fetchall()
+
+        if not rows:
+            print("✅ Nothing to backfill — all articles have data.")
+            telegram_send(session, "✅ Backfill: semua artikel sudah lengkap.")
+            return
+
+        updated = 0
+        for fp, url, title, summary, source, sent_label, hashtags in rows:
+            changes = {}
+
+            # Backfill source
+            if not source:
+                inferred = _infer_source_from_url(url)
+                if inferred:
+                    changes["source"] = inferred
+
+            # Backfill sentiment
+            if not sent_label:
+                sentiment = analyze_sentiment(title or "", summary or "")
+                changes["sentiment_label"] = sentiment["label"]
+                changes["sentiment_score"] = sentiment["score"]
+
+            # Backfill hashtags
+            if not hashtags:
+                tags_str = " ".join(make_hashtags(title or "", url or ""))
+                changes["hashtags"] = tags_str
+
+            if changes:
+                set_clauses = ", ".join(f"{k} = ?" for k in changes)
+                values = list(changes.values()) + [fp]
+                cur.execute(f"UPDATE seen SET {set_clauses} WHERE fingerprint = ?", values)
+                updated += 1
+
+        con.commit()
+        print(f"✅ Backfilled {updated}/{len(rows)} articles.")
+        telegram_send(session, f"✅ Backfill selesai: {updated} artikel diperbarui dari {len(rows)} yang kosong.")
+
+    except Exception as e:
+        err = f"❌ Backfill FAILED: {type(e).__name__}: {e}"
+        print(err)
+        try:
+            telegram_send(session, err)
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+# =============================================================================
 # COMMAND: EXPORT CSV
 # =============================================================================
 def cmd_export(chat_id_override=None):
@@ -1662,6 +1753,7 @@ TELEGRAM_COMMANDS = {
     "/export": "Export semua artikel ke CSV",
     "/report": "Buat & kirim laporan PDF mingguan",
     "/health": "Cek status sumber berita",
+    "/backfill": "Isi ulang data lama (source/sentimen)",
 }
 
 
@@ -1888,6 +1980,8 @@ def handle_bot_command(session, command, chat_id, con):
             _handle_reactions_command(session, con)
         elif cmd == "/dashboard":
             cmd_dashboard()
+        elif cmd == "/backfill":
+            cmd_backfill()
         else:
             telegram_send(session, f"❓ Perintah tidak dikenal: <code>{html.escape(cmd)}</code>\nKetik /help untuk daftar.")
     finally:
@@ -2005,6 +2099,7 @@ def cmd_setup():
         {"command": "export", "description": "Export artikel ke CSV"},
         {"command": "report", "description": "Laporan PDF mingguan"},
         {"command": "health", "description": "Status sumber berita"},
+        {"command": "backfill", "description": "Isi ulang data lama"},
     ]
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
     for scope in [None, {"type": "all_group_chats"}]:
@@ -2057,7 +2152,7 @@ def cmd_dashboard():
         # ── Source breakdown (30 days) ──
         cur.execute("SELECT source, COUNT(*) c FROM seen WHERE first_seen_utc >= ? GROUP BY source ORDER BY c DESC LIMIT 12",
                     ((now_utc - timedelta(days=30)).isoformat(),))
-        source_data = [{"source": s, "count": c} for s, c in cur.fetchall()]
+        source_data = [{"source": s, "count": c} for s, c in cur.fetchall() if s]  # filter empty sources
 
         # ── Topic heatmap (7 days x top 10 tags) ──
         week_cut = (now_utc - timedelta(days=7)).isoformat()
@@ -2100,7 +2195,7 @@ def cmd_dashboard():
 
         tone_data = []
         for src, data in tone_sources.items():
-            if data["total"] < 2:
+            if data["total"] < 2 or not src:  # skip empty source names
                 continue
             tone = round((data["Positif"] - data["Negatif"]) / data["total"], 2)
             tone_data.append({"source": src, "tone": tone, **data})
@@ -2141,6 +2236,21 @@ def cmd_dashboard():
         reaction_data = [{"title": t or "", "url": u or "", "ups": up, "downs": dn}
                          for t, u, up, dn in cur.fetchall()]
 
+        # ── Week-over-week comparison ──
+        last_week_cut = (now_utc - timedelta(days=14)).isoformat()
+        cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc < ?",
+                    (last_week_cut, week_cut))
+        lw_total = cur.fetchone()[0]
+        cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc < ? GROUP BY sentiment_label",
+                    (last_week_cut, week_cut))
+        lw_sent = dict(cur.fetchall())
+
+        # ── Top recent articles (positive & negative) ──
+        cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Positif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
+        top_positive = [{"title": t, "url": u, "source": s} for t, u, s, _ in cur.fetchall()]
+        cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Negatif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
+        top_negative = [{"title": t, "url": u, "source": s} for t, u, s, _ in cur.fetchall()]
+
         # ── Generate HTML ──
         dashboard_json = json.dumps({
             "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
@@ -2151,6 +2261,12 @@ def cmd_dashboard():
                 "negatif_7d": wk_sent.get("Negatif", 0),
                 "netral_7d": wk_sent.get("Netral", 0),
             },
+            "wow": {
+                "lw_total": lw_total,
+                "lw_positif": lw_sent.get("Positif", 0),
+                "lw_negatif": lw_sent.get("Negatif", 0),
+                "lw_netral": lw_sent.get("Netral", 0),
+            },
             "daily_sentiment": daily_data,
             "sources": source_data,
             "heatmap_tags": top_10_tags,
@@ -2158,18 +2274,23 @@ def cmd_dashboard():
             "tone": tone_data,
             "lang_daily": lang_daily,
             "reactions": reaction_data,
+            "top_positive": top_positive,
+            "top_negative": top_negative,
         }, ensure_ascii=False)
 
         html_content = _build_dashboard_html(dashboard_json)
 
         os.makedirs(os.path.dirname(DASHBOARD_HTML_PATH) or ".", exist_ok=True)
+
+        # Create .nojekyll so GitHub Pages serves raw HTML
+        nojekyll_path = os.path.join(os.path.dirname(DASHBOARD_HTML_PATH), ".nojekyll")
+        if not os.path.exists(nojekyll_path):
+            open(nojekyll_path, "w").close()
+
         with open(DASHBOARD_HTML_PATH, "w", encoding="utf-8") as f:
             f.write(html_content)
 
         print(f"✅ Dashboard generated: {DASHBOARD_HTML_PATH}")
-
-        session = build_session()
-        telegram_send(session, f"📊 Dashboard updated: {total_7d} articles this week.")
 
     except Exception as e:
         err = f"❌ Dashboard FAILED: {type(e).__name__}: {e}"
@@ -2190,53 +2311,97 @@ def _build_dashboard_html(data_json: str) -> str:
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-         background: #0f172a; color: #e2e8f0; padding: 20px; }}
+         background: #0f172a; color: #e2e8f0; padding: 16px; min-height: 100vh; }}
   .container {{ max-width: 1200px; margin: 0 auto; }}
-  h1 {{ font-size: 1.8rem; margin-bottom: 4px; }}
-  .subtitle {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 16px; }}
-  .card {{ background: #1e293b; border-radius: 12px; padding: 20px; }}
-  .card h2 {{ font-size: 1rem; color: #94a3b8; margin-bottom: 12px; }}
-  .stat-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
-  .stat {{ text-align: center; }}
-  .stat .num {{ font-size: 1.8rem; font-weight: 700; }}
-  .stat .label {{ font-size: 0.75rem; color: #94a3b8; }}
+  .header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }}
+  .header-icon {{ width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center;
+                  justify-content: center; font-size: 24px; background: linear-gradient(135deg, #1e40af, #3b82f6); }}
+  h1 {{ font-size: 1.6rem; font-weight: 700; }}
+  .subtitle {{ color: #64748b; font-size: 0.85rem; margin-bottom: 20px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 14px; }}
+  .grid-3 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 14px; }}
+  .card {{ background: #1e293b; border-radius: 14px; padding: 18px; border: 1px solid #1e3a5f; }}
+  .card h2 {{ font-size: 0.85rem; color: #64748b; margin-bottom: 12px; text-transform: uppercase;
+              letter-spacing: 0.5px; }}
+  .stat-row {{ display: flex; gap: 16px; flex-wrap: wrap; }}
+  .stat {{ flex: 1; min-width: 80px; }}
+  .stat .num {{ font-size: 2rem; font-weight: 800; line-height: 1.1; }}
+  .stat .label {{ font-size: 0.7rem; color: #64748b; margin-top: 2px; }}
+  .stat .change {{ font-size: 0.7rem; margin-top: 2px; }}
+  .up {{ color: #4ade80; }} .down {{ color: #f87171; }} .flat {{ color: #64748b; }}
   .pos {{ color: #4ade80; }} .neg {{ color: #f87171; }} .neu {{ color: #94a3b8; }}
-  canvas {{ max-height: 280px; }}
-  .heatmap {{ display: grid; gap: 2px; font-size: 0.7rem; }}
-  .heatmap-cell {{ padding: 4px; text-align: center; border-radius: 3px; min-width: 30px; }}
-  .heatmap-header {{ font-weight: 600; color: #94a3b8; padding: 4px; text-align: center; }}
-  .tone-bar {{ display: flex; align-items: center; margin: 4px 0; font-size: 0.8rem; }}
-  .tone-bar .bar {{ height: 12px; border-radius: 6px; margin: 0 8px; min-width: 4px; }}
-  .tone-pos {{ background: #4ade80; }} .tone-neg {{ background: #f87171; }}
-  .reaction-item {{ padding: 6px 0; border-bottom: 1px solid #334155; font-size: 0.85rem; }}
-  .reaction-item a {{ color: #60a5fa; text-decoration: none; }}
+  canvas {{ max-height: 260px; }}
+  .heatmap {{ display: grid; gap: 2px; font-size: 0.65rem; }}
+  .heatmap-cell {{ padding: 6px 2px; text-align: center; border-radius: 4px; min-width: 28px; font-weight: 500; }}
+  .heatmap-header {{ font-weight: 600; color: #64748b; padding: 6px 2px; text-align: center; font-size: 0.65rem; }}
+  .tone-bar {{ display: flex; align-items: center; margin: 6px 0; font-size: 0.8rem; gap: 8px; }}
+  .tone-bar .name {{ min-width: 130px; color: #cbd5e1; font-weight: 500; white-space: nowrap; overflow: hidden;
+                     text-overflow: ellipsis; }}
+  .tone-bar .bar {{ height: 14px; border-radius: 7px; min-width: 4px; transition: width 0.3s; }}
+  .tone-bar .val {{ color: #94a3b8; min-width: 80px; font-size: 0.75rem; }}
+  .tone-pos {{ background: linear-gradient(90deg, #22c55e, #4ade80); }}
+  .tone-neg {{ background: linear-gradient(90deg, #ef4444, #f87171); }}
+  .article-list {{ list-style: none; }}
+  .article-list li {{ padding: 8px 0; border-bottom: 1px solid #1e3a5f; display: flex; gap: 8px;
+                      font-size: 0.82rem; line-height: 1.4; }}
+  .article-list li:last-child {{ border-bottom: none; }}
+  .article-list .dot {{ flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; }}
+  .article-list a {{ color: #93c5fd; text-decoration: none; }}
+  .article-list a:hover {{ color: #60a5fa; text-decoration: underline; }}
+  .article-list .src {{ color: #64748b; font-size: 0.7rem; }}
+  .reaction-item {{ padding: 8px 0; border-bottom: 1px solid #1e3a5f; font-size: 0.82rem;
+                    display: flex; align-items: center; gap: 8px; }}
+  .reaction-item:last-child {{ border-bottom: none; }}
+  .reaction-item a {{ color: #93c5fd; text-decoration: none; flex: 1; }}
   .reaction-item a:hover {{ text-decoration: underline; }}
-  .footer {{ text-align: center; color: #475569; font-size: 0.75rem; margin-top: 30px; }}
+  .reaction-votes {{ color: #94a3b8; font-size: 0.75rem; white-space: nowrap; }}
+  .footer {{ text-align: center; color: #334155; font-size: 0.7rem; margin-top: 28px; padding: 12px;
+             border-top: 1px solid #1e293b; }}
+  @media (max-width: 700px) {{
+    .stat .num {{ font-size: 1.5rem; }}
+    .grid {{ grid-template-columns: 1fr; }}
+  }}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>🛃 BC News Monitor</h1>
+  <div class="header">
+    <div class="header-icon">🛃</div>
+    <div><h1>BC News Monitor</h1></div>
+  </div>
   <div class="subtitle" id="generated"></div>
 
   <!-- Summary Cards -->
-  <div class="grid">
+  <div class="grid-3">
     <div class="card">
-      <h2>📊 Ringkasan Minggu Ini</h2>
-      <div class="stat-grid">
-        <div class="stat"><div class="num" id="total7d">-</div><div class="label">Total</div></div>
-        <div class="stat"><div class="num pos" id="pos7d">-</div><div class="label">Positif</div></div>
-        <div class="stat"><div class="num neg" id="neg7d">-</div><div class="label">Negatif</div></div>
-      </div>
+      <h2>Total Minggu Ini</h2>
+      <div class="stat"><div class="num" id="total7d">-</div>
+      <div class="change" id="wowTotal"></div></div>
     </div>
     <div class="card">
-      <h2>📰 30 Hari Terakhir</h2>
-      <div class="stat-grid">
-        <div class="stat"><div class="num" id="total30d">-</div><div class="label">Total Artikel</div></div>
-        <div class="stat"><div class="num neu" id="neu7d">-</div><div class="label">Netral (7d)</div></div>
-        <div class="stat"><div class="num" style="color:#60a5fa" id="avgDaily">-</div><div class="label">Avg/Hari</div></div>
-      </div>
+      <h2>Sentimen Positif</h2>
+      <div class="stat"><div class="num pos" id="pos7d">-</div>
+      <div class="change" id="wowPos"></div></div>
+    </div>
+    <div class="card">
+      <h2>Sentimen Negatif</h2>
+      <div class="stat"><div class="num neg" id="neg7d">-</div>
+      <div class="change" id="wowNeg"></div></div>
+    </div>
+  </div>
+
+  <div class="grid-3">
+    <div class="card">
+      <h2>Netral (7 hari)</h2>
+      <div class="stat"><div class="num neu" id="neu7d">-</div></div>
+    </div>
+    <div class="card">
+      <h2>Total 30 Hari</h2>
+      <div class="stat"><div class="num" style="color:#60a5fa" id="total30d">-</div></div>
+    </div>
+    <div class="card">
+      <h2>Rata-rata / Hari</h2>
+      <div class="stat"><div class="num" style="color:#a78bfa" id="avgDaily">-</div></div>
     </div>
   </div>
 
@@ -2255,7 +2420,7 @@ def _build_dashboard_html(data_json: str) -> str:
   <!-- Charts Row 2 -->
   <div class="grid">
     <div class="card">
-      <h2>📰 Top Sumber</h2>
+      <h2>📰 Top Sumber Berita</h2>
       <canvas id="sourceChart"></canvas>
     </div>
     <div class="card">
@@ -2265,124 +2430,180 @@ def _build_dashboard_html(data_json: str) -> str:
   </div>
 
   <!-- Heatmap -->
-  <div class="card" style="margin-bottom:16px">
+  <div class="card" style="margin-bottom:14px">
     <h2>🏷️ Topic Heatmap (7 hari)</h2>
     <div id="heatmapContainer" style="overflow-x:auto"></div>
   </div>
 
+  <!-- Articles Row -->
+  <div class="grid">
+    <div class="card">
+      <h2>🟢 Berita Positif Terbaru</h2>
+      <ul class="article-list" id="posArticles"></ul>
+    </div>
+    <div class="card">
+      <h2>🔴 Berita Negatif Terbaru</h2>
+      <ul class="article-list" id="negArticles"></ul>
+    </div>
+  </div>
+
   <!-- Reactions -->
-  <div class="card" style="margin-bottom:16px">
+  <div class="card" style="margin-bottom:14px">
     <h2>👍 Top Voted Articles</h2>
     <div id="reactionsContainer"></div>
   </div>
 
-  <div class="footer">BC News Monitor — Auto-generated dashboard</div>
+  <div class="footer">BC News Monitor v3 — Auto-generated dashboard — Powered by Google News RSS</div>
 </div>
 
 <script>
-const DATA = {data_json};
+const D = {data_json};
+
+// Helper
+function wowArrow(curr, prev) {{
+  if (prev === 0) return '<span class="flat">— baru</span>';
+  const diff = curr - prev;
+  const pct = ((diff / prev) * 100).toFixed(0);
+  if (diff > 0) return '<span class="up">▲ +' + diff + ' (' + pct + '%)</span>';
+  if (diff < 0) return '<span class="down">▼ ' + diff + ' (' + pct + '%)</span>';
+  return '<span class="flat">— sama</span>';
+}}
 
 // Summary
-document.getElementById('generated').textContent = 'Updated: ' + DATA.generated;
-document.getElementById('total7d').textContent = DATA.summary.total_7d;
-document.getElementById('total30d').textContent = DATA.summary.total_30d;
-document.getElementById('pos7d').textContent = DATA.summary.positif_7d;
-document.getElementById('neg7d').textContent = DATA.summary.negatif_7d;
-document.getElementById('neu7d').textContent = DATA.summary.netral_7d;
-document.getElementById('avgDaily').textContent = (DATA.summary.total_30d / 30).toFixed(1);
+document.getElementById('generated').textContent = 'Last updated: ' + D.generated;
+document.getElementById('total7d').textContent = D.summary.total_7d;
+document.getElementById('total30d').textContent = D.summary.total_30d;
+document.getElementById('pos7d').textContent = D.summary.positif_7d;
+document.getElementById('neg7d').textContent = D.summary.negatif_7d;
+document.getElementById('neu7d').textContent = D.summary.netral_7d;
+document.getElementById('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
+
+// WoW
+document.getElementById('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
+document.getElementById('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
+document.getElementById('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
 
 // Chart defaults
 Chart.defaults.color = '#94a3b8';
-Chart.defaults.borderColor = '#334155';
+Chart.defaults.borderColor = '#1e3a5f';
+Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif';
 
 // Sentiment Line Chart
 new Chart(document.getElementById('sentimentChart'), {{
   type: 'line',
   data: {{
-    labels: DATA.daily_sentiment.map(d => d.date),
+    labels: D.daily_sentiment.map(d => d.date),
     datasets: [
-      {{ label: 'Positif', data: DATA.daily_sentiment.map(d => d.Positif),
-         borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', fill: true, tension: 0.3 }},
-      {{ label: 'Negatif', data: DATA.daily_sentiment.map(d => d.Negatif),
-         borderColor: '#f87171', backgroundColor: 'rgba(248,113,113,0.1)', fill: true, tension: 0.3 }},
-      {{ label: 'Netral', data: DATA.daily_sentiment.map(d => d.Netral),
-         borderColor: '#94a3b8', backgroundColor: 'rgba(148,163,184,0.05)', fill: true, tension: 0.3 }},
+      {{ label: 'Positif', data: D.daily_sentiment.map(d => d.Positif),
+         borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.08)', fill: true, tension: 0.4, borderWidth: 2, pointRadius: 0 }},
+      {{ label: 'Negatif', data: D.daily_sentiment.map(d => d.Negatif),
+         borderColor: '#f87171', backgroundColor: 'rgba(248,113,113,0.08)', fill: true, tension: 0.4, borderWidth: 2, pointRadius: 0 }},
+      {{ label: 'Netral', data: D.daily_sentiment.map(d => d.Netral),
+         borderColor: '#64748b', backgroundColor: 'rgba(100,116,139,0.05)', fill: true, tension: 0.4, borderWidth: 1.5, pointRadius: 0 }},
     ]
   }},
-  options: {{ responsive: true, plugins: {{ legend: {{ position: 'bottom' }} }},
-    scales: {{ x: {{ ticks: {{ maxTicksLimit: 10 }} }}, y: {{ beginAtZero: true }} }} }}
+  options: {{ responsive: true, interaction: {{ intersect: false, mode: 'index' }},
+    plugins: {{ legend: {{ position: 'bottom', labels: {{ usePointStyle: true, padding: 16 }} }} }},
+    scales: {{ x: {{ ticks: {{ maxTicksLimit: 8, font: {{ size: 10 }} }} }}, y: {{ beginAtZero: true }} }} }}
 }});
 
 // Language Chart
 new Chart(document.getElementById('langChart'), {{
   type: 'bar',
   data: {{
-    labels: DATA.lang_daily.map(d => d.date),
+    labels: D.lang_daily.map(d => d.date),
     datasets: [
-      {{ label: 'Indonesia', data: DATA.lang_daily.map(d => d.id), backgroundColor: '#ef4444' }},
-      {{ label: 'English', data: DATA.lang_daily.map(d => d.en), backgroundColor: '#3b82f6' }},
+      {{ label: '🇮🇩 Indonesia', data: D.lang_daily.map(d => d.id), backgroundColor: '#ef4444', borderRadius: 2 }},
+      {{ label: '🌐 English', data: D.lang_daily.map(d => d.en), backgroundColor: '#3b82f6', borderRadius: 2 }},
     ]
   }},
-  options: {{ responsive: true, plugins: {{ legend: {{ position: 'bottom' }} }},
-    scales: {{ x: {{ stacked: true, ticks: {{ maxTicksLimit: 10 }} }}, y: {{ stacked: true, beginAtZero: true }} }} }}
+  options: {{ responsive: true,
+    plugins: {{ legend: {{ position: 'bottom', labels: {{ usePointStyle: true, padding: 16 }} }} }},
+    scales: {{ x: {{ stacked: true, ticks: {{ maxTicksLimit: 8, font: {{ size: 10 }} }} }},
+               y: {{ stacked: true, beginAtZero: true }} }} }}
 }});
 
 // Source Bar Chart
+const srcColors = ['#6366f1','#8b5cf6','#a78bfa','#c4b5fd','#818cf8','#6366f1','#7c3aed','#5b21b6','#4f46e5','#4338ca','#3730a3','#312e81'];
 new Chart(document.getElementById('sourceChart'), {{
   type: 'bar',
   data: {{
-    labels: DATA.sources.map(d => d.source.length > 25 ? d.source.slice(0,25) + '...' : d.source),
-    datasets: [{{ label: 'Artikel', data: DATA.sources.map(d => d.count),
-      backgroundColor: '#6366f1' }}]
+    labels: D.sources.map(d => d.source.length > 28 ? d.source.slice(0,28)+'…' : d.source),
+    datasets: [{{ data: D.sources.map(d => d.count),
+      backgroundColor: D.sources.map((_, i) => srcColors[i % srcColors.length]),
+      borderRadius: 4 }}]
   }},
   options: {{ responsive: true, indexAxis: 'y', plugins: {{ legend: {{ display: false }} }},
-    scales: {{ x: {{ beginAtZero: true }} }} }}
+    scales: {{ x: {{ beginAtZero: true }}, y: {{ ticks: {{ font: {{ size: 11 }} }} }} }} }}
 }});
 
 // Media Tone
 const toneEl = document.getElementById('toneContainer');
-DATA.tone.forEach(d => {{
-  const maxBar = 120;
-  const barW = Math.max(4, Math.abs(d.tone) * maxBar);
-  const cls = d.tone >= 0 ? 'tone-pos' : 'tone-neg';
-  const sign = d.tone >= 0 ? '+' : '';
-  toneEl.innerHTML += '<div class="tone-bar">' +
-    '<span style="min-width:140px;display:inline-block">' + d.source.slice(0,30) + '</span>' +
-    '<div class="bar ' + cls + '" style="width:' + barW + 'px"></div>' +
-    '<span>' + sign + d.tone.toFixed(2) + ' (' + d.total + ')</span></div>';
-}});
-if (!DATA.tone.length) toneEl.innerHTML = '<div style="color:#475569">Belum ada data</div>';
+if (D.tone.length) {{
+  D.tone.forEach(d => {{
+    const maxBar = 140;
+    const barW = Math.max(6, Math.abs(d.tone) * maxBar);
+    const cls = d.tone >= 0 ? 'tone-pos' : 'tone-neg';
+    const sign = d.tone >= 0 ? '+' : '';
+    toneEl.innerHTML += '<div class="tone-bar">' +
+      '<span class="name">' + d.source.slice(0,30) + '</span>' +
+      '<div class="bar ' + cls + '" style="width:' + barW + 'px"></div>' +
+      '<span class="val">' + sign + d.tone.toFixed(2) + ' (' + d.total + ' art)</span></div>';
+  }});
+}} else {{
+  toneEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada data</div>';
+}}
 
 // Heatmap
 const hmEl = document.getElementById('heatmapContainer');
-if (DATA.heatmap_tags.length && DATA.heatmap.length) {{
-  const cols = DATA.heatmap_tags.length + 1;
-  let grid = '<div class="heatmap" style="grid-template-columns: 70px repeat(' + (cols-1) + ', 1fr)">';
+if (D.heatmap_tags.length && D.heatmap.length) {{
+  const cols = D.heatmap_tags.length + 1;
+  let grid = '<div class="heatmap" style="grid-template-columns: 72px repeat(' + (cols-1) + ', 1fr)">';
   grid += '<div class="heatmap-header"></div>';
-  DATA.heatmap_tags.forEach(t => {{ grid += '<div class="heatmap-header">' + t + '</div>'; }});
-  DATA.heatmap.forEach(row => {{
+  D.heatmap_tags.forEach(t => {{ grid += '<div class="heatmap-header">' + t + '</div>'; }});
+  D.heatmap.forEach(row => {{
     grid += '<div class="heatmap-header">' + row.date + '</div>';
-    DATA.heatmap_tags.forEach(tag => {{
+    D.heatmap_tags.forEach(tag => {{
       const v = row[tag] || 0;
-      const opacity = v === 0 ? 0.05 : Math.min(0.2 + v * 0.15, 1);
-      grid += '<div class="heatmap-cell" style="background:rgba(99,102,241,' + opacity + ')">' + (v || '') + '</div>';
+      const opacity = v === 0 ? 0.03 : Math.min(0.15 + v * 0.012, 0.95);
+      grid += '<div class="heatmap-cell" style="background:rgba(99,102,241,' + opacity + ');' +
+        (v > 0 ? 'color:#e2e8f0' : 'color:#1e293b') + '">' + (v || '') + '</div>';
     }});
   }});
   grid += '</div>';
   hmEl.innerHTML = grid;
 }} else {{
-  hmEl.innerHTML = '<div style="color:#475569">Belum ada data</div>';
+  hmEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada data</div>';
 }}
+
+// Top Articles
+function renderArticles(containerId, articles, dotColor) {{
+  const el = document.getElementById(containerId);
+  if (!articles || !articles.length) {{
+    el.innerHTML = '<li style="color:#334155;padding:8px 0">Belum ada data</li>';
+    return;
+  }}
+  articles.forEach(a => {{
+    const t = (a.title || '').slice(0, 90);
+    const s = (a.source || '').slice(0, 25);
+    el.innerHTML += '<li><div class="dot" style="background:' + dotColor + '"></div>' +
+      '<div><a href="' + (a.url || '#') + '" target="_blank">' + t + '</a>' +
+      '<div class="src">' + s + '</div></div></li>';
+  }});
+}}
+renderArticles('posArticles', D.top_positive, '#4ade80');
+renderArticles('negArticles', D.top_negative, '#f87171');
 
 // Reactions
 const rxEl = document.getElementById('reactionsContainer');
-if (DATA.reactions.length) {{
-  DATA.reactions.forEach(r => {{
-    rxEl.innerHTML += '<div class="reaction-item">👍' + r.ups + ' 👎' + r.downs +
-      ' — <a href="' + r.url + '" target="_blank">' + r.title.slice(0, 80) + '</a></div>';
+if (D.reactions.length) {{
+  D.reactions.forEach(r => {{
+    rxEl.innerHTML += '<div class="reaction-item">' +
+      '<span class="reaction-votes">👍' + r.ups + ' 👎' + r.downs + '</span>' +
+      '<a href="' + r.url + '" target="_blank">' + r.title.slice(0, 80) + '</a></div>';
   }});
 }} else {{
-  rxEl.innerHTML = '<div style="color:#475569">Belum ada vote</div>';
+  rxEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada vote — tap 👍/👎 di Telegram</div>';
 }}
 </script>
 </body>
@@ -2402,6 +2623,7 @@ def main():
         "export": cmd_export,
         "report": cmd_report,
         "dashboard": cmd_dashboard,
+        "backfill": cmd_backfill,
         "poll": cmd_poll,
         "setup": cmd_setup,
     }
