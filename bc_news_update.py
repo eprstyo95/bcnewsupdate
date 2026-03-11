@@ -13,7 +13,7 @@ Usage:
   python bc_news_update.py setup        # Register Telegram bot menu
 
 Features:
-  - Google News RSS + NewsAPI dual source
+  - Google News RSS (Indonesian + English)
   - Multi-language: Indonesian + English international coverage
   - Sentiment analysis (offline, Indonesian + English)
   - Trending detection (topic spike alerts)
@@ -43,23 +43,16 @@ DB_FILE = "seen.sqlite"
 
 # Indonesian queries
 QUERY_RSS_ID = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan" when:24h'
-QUERY_NEWSAPI_ID = '(bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan")'
 
 # English queries (international coverage)
 QUERY_RSS_EN = '("Indonesia customs" OR "Indonesia tariff" OR "DGCE Indonesia" OR "Indonesia trade policy" OR "Indonesia import export") when:24h'
-QUERY_NEWSAPI_EN = '("Indonesia customs" OR "Indonesia tariff" OR "Indonesia trade" OR "Indonesia import" OR "Indonesia export")'
 
 MAX_AGE_HOURS = 24
 
 GOOGLE_RSS_SIZE = 30
-NEWSAPI_PAGE_SIZE = 20
-
-NEWSAPI_EXCLUDE_DOMAINS = "globenewswire.com,prnewswire.com,businesswire.com"
 
 MAX_ITEMS_PER_BATCH = 1
 SEND_HEARTBEAT = True
-
-DEBUG_NEWSAPI = False
 
 INCLUDE_SNIPPET = True
 SNIPPET_MAX_CHARS = 150
@@ -79,7 +72,6 @@ REPORT_PDF_PATH = "bc_weekly_report.pdf"
 # =========================
 # ENV VARS (GitHub Secrets)
 # =========================
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PRIVATE_CHAT_ID = os.environ.get("TELEGRAM_PRIVATE_CHAT_ID", "")
@@ -405,17 +397,6 @@ def fmt_wib(dt_utc):
     return dt_utc.astimezone(WIB).strftime("%Y-%m-%d %H:%M WIB")
 
 
-def parse_newsapi_datetime(s):
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
 def entry_published_utc(entry):
     t = entry.get("published_parsed") or entry.get("updated_parsed")
     if not t:
@@ -695,46 +676,6 @@ def fetch_google_news_rss(session, query, language="id"):
     return out
 
 
-# =========================
-# NEWSAPI
-# =========================
-def fetch_newsapi(session, query, cutoff_utc, language=None):
-    if not NEWSAPI_KEY:
-        return []
-    params = {
-        "q": query, "searchIn": "title,description", "sortBy": "publishedAt",
-        "pageSize": NEWSAPI_PAGE_SIZE, "apiKey": NEWSAPI_KEY,
-        "excludeDomains": NEWSAPI_EXCLUDE_DOMAINS,
-        "from": cutoff_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "to": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    }
-    if language:
-        params["language"] = language
-
-    r = request_with_retry(session, "GET", "https://newsapi.org/v2/everything", params=params, timeout=25)
-    try:
-        data = r.json()
-    except Exception:
-        return []
-    if data.get("status") != "ok":
-        return []
-
-    lang_code = language or "id"
-    out = []
-    for a in data.get("articles", []):
-        pub = parse_newsapi_datetime(a.get("publishedAt"))
-        out.append({
-            "source": f"NewsAPI-{lang_code.upper()}:{(a.get('source', {}) or {}).get('name', '')}".strip(),
-            "title": (a.get("title") or "").strip(),
-            "summary": (a.get("description") or "").strip(),
-            "description": (a.get("description") or "").strip(),
-            "url": norm_url(a.get("url") or ""),
-            "published_utc": pub,
-            "language": lang_code,
-        })
-    return out
-
-
 # =============================================================================
 # COMMAND: NORMAL RUN
 # =============================================================================
@@ -751,17 +692,11 @@ def cmd_run():
         rss_id = fetch_google_news_rss(session, QUERY_RSS_ID, language="id")
         record_source_health(con, "GoogleNews-ID", len(rss_id))
 
-        api_id = fetch_newsapi(session, QUERY_NEWSAPI_ID, cutoff, language="id")
-        record_source_health(con, "NewsAPI-ID", len(api_id))
-
         # Fetch English sources
         rss_en = fetch_google_news_rss(session, QUERY_RSS_EN, language="en")
         record_source_health(con, "GoogleNews-EN", len(rss_en))
 
-        api_en = fetch_newsapi(session, QUERY_NEWSAPI_EN, cutoff, language="en")
-        record_source_health(con, "NewsAPI-EN", len(api_en))
-
-        items = rss_id + api_id + rss_en + api_en
+        items = rss_id + rss_en
 
         # Deduplicate by fingerprint
         by_fp = {}
