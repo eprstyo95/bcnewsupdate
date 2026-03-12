@@ -2166,10 +2166,19 @@ def cmd_dashboard():
                 "Netral": counts.get("Netral", 0),
             })
 
-        # ── Source breakdown (30 days) ──
-        cur.execute("SELECT source, COUNT(*) c FROM seen WHERE first_seen_utc >= ? GROUP BY source ORDER BY c DESC LIMIT 12",
+        # ── Source breakdown by domain (30 days) ──
+        cur.execute("SELECT url FROM seen WHERE first_seen_utc >= ? AND url != ''",
                     ((now_utc - timedelta(days=30)).isoformat(),))
-        source_data = [{"source": s, "count": c} for s, c in cur.fetchall() if s]  # filter empty sources
+        domain_counter = Counter()
+        for (url_val,) in cur.fetchall():
+            try:
+                netloc = urlsplit(url_val).netloc.lower().replace("www.", "")
+                if netloc:
+                    # Clean up: strip subdomains for common sites
+                    domain_counter[netloc] += 1
+            except Exception:
+                pass
+        source_data = [{"source": d, "count": c} for d, c in domain_counter.most_common(15) if d]
 
         # ── Topic heatmap (7 days x top 10 tags) ──
         week_cut = (now_utc - timedelta(days=7)).isoformat()
@@ -2197,18 +2206,21 @@ def cmd_dashboard():
                 row[tag] = day_tags.get(tag, 0)
             heatmap_data.append(row)
 
-        # ── Media tone (7 days) ──
-        cur.execute("""
-            SELECT source, sentiment_label, COUNT(*)
-            FROM seen WHERE first_seen_utc >= ?
-            GROUP BY source, sentiment_label
-        """, (week_cut,))
+        # ── Media tone by domain (7 days) ──
+        cur.execute("SELECT url, sentiment_label FROM seen WHERE first_seen_utc >= ? AND url != '' AND sentiment_label != ''",
+                    (week_cut,))
         tone_sources = {}
-        for src, label, cnt in cur.fetchall():
-            if src not in tone_sources:
-                tone_sources[src] = {"Positif": 0, "Negatif": 0, "Netral": 0, "total": 0}
-            tone_sources[src][label] = cnt
-            tone_sources[src]["total"] += cnt
+        for url_val, label in cur.fetchall():
+            try:
+                domain = urlsplit(url_val).netloc.lower().replace("www.", "")
+            except Exception:
+                continue
+            if not domain:
+                continue
+            if domain not in tone_sources:
+                tone_sources[domain] = {"Positif": 0, "Negatif": 0, "Netral": 0, "total": 0}
+            tone_sources[domain][label] = tone_sources[domain].get(label, 0) + 1
+            tone_sources[domain]["total"] += 1
 
         tone_data = []
         for src, data in tone_sources.items():
@@ -2263,10 +2275,16 @@ def cmd_dashboard():
         lw_sent = dict(cur.fetchall())
 
         # ── Top recent articles (positive & negative) ──
+        def _extract_domain(url_val):
+            try:
+                return urlsplit(url_val or "").netloc.lower().replace("www.", "") or ""
+            except Exception:
+                return ""
+
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Positif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
-        top_positive = [{"title": t, "url": u, "source": s} for t, u, s, _ in cur.fetchall()]
+        top_positive = [{"title": t, "url": u, "source": _extract_domain(u) or s} for t, u, s, _ in cur.fetchall()]
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Negatif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
-        top_negative = [{"title": t, "url": u, "source": s} for t, u, s, _ in cur.fetchall()]
+        top_negative = [{"title": t, "url": u, "source": _extract_domain(u) or s} for t, u, s, _ in cur.fetchall()]
 
         # ── Recent headlines (all, last 50) ──
         cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
@@ -2280,8 +2298,13 @@ def cmd_dashboard():
                 time_str = dt.strftime("%d/%m %H:%M")
             except Exception:
                 time_str = ""
+            # Extract domain as display source
+            try:
+                display_src = urlsplit(url or "").netloc.lower().replace("www.", "") or source or ""
+            except Exception:
+                display_src = source or ""
             recent_articles.append({
-                "title": title or "", "url": url or "", "source": source or "",
+                "title": title or "", "url": url or "", "source": display_src,
                 "sentiment": sent or "Netral", "time": time_str,
                 "tags": (tags or "").split()[:3], "lang": lang or "id",
             })
