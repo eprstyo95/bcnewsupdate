@@ -691,10 +691,23 @@ def detect_trending(con):
     return trending
 
 
-def send_trending_alert(session, trending_topics):
-    """Send a trending alert if any topics are spiking."""
+def send_trending_alert(session, trending_topics, con=None, force=False):
+    """Send a trending alert if any topics are spiking. Respects cooldown unless force=True."""
     if not trending_topics:
         return
+
+    # Cooldown: only send every 2 hours (skip if force=True, e.g. from /trending command)
+    TRENDING_COOLDOWN_HOURS = 2
+    if con and not force:
+        last_sent = get_bot_state(con, "trending_last_sent")
+        if last_sent:
+            try:
+                last_dt = datetime.fromisoformat(last_sent)
+                if datetime.now(timezone.utc) - last_dt < timedelta(hours=TRENDING_COOLDOWN_HOURS):
+                    print(f"Trending: cooldown active (last sent {last_sent}), skipping.")
+                    return
+            except Exception:
+                pass
 
     lines = [f"🔥 <b>TRENDING — {len(trending_topics)} topik sedang ramai!</b>\n"]
 
@@ -711,6 +724,10 @@ def send_trending_alert(session, trending_topics):
     text = "\n".join(lines)
     for part in chunk_text(text):
         telegram_send(session, part)
+
+    # Update cooldown timestamp
+    if con:
+        set_bot_state(con, "trending_last_sent", datetime.now(timezone.utc).isoformat())
 
 
 # =========================
@@ -1023,9 +1040,9 @@ def cmd_run():
 
         send_updates_batched(session, new_items)
 
-        # Trending detection
+        # Trending detection (with 2-hour cooldown)
         trending = detect_trending(con)
-        send_trending_alert(session, trending)
+        send_trending_alert(session, trending, con=con)
 
         # Sentiment shift alert (compare today vs 7-day average)
         shift_alert = detect_sentiment_shift(con)
@@ -1993,7 +2010,7 @@ def _handle_trending_command(session, con):
     if not trending:
         telegram_send(session, f"📊 <b>Trending</b>\n\nTidak ada topik trending saat ini (threshold: {TRENDING_THRESHOLD} artikel dalam {TRENDING_WINDOW_HOURS} jam).")
         return
-    send_trending_alert(session, trending)
+    send_trending_alert(session, trending, con=con, force=True)
 
 
 def _handle_health_command(session, con):
