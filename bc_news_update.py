@@ -459,11 +459,14 @@ def record_source_health(con, source_name, article_count):
 
 
 def check_source_health_alerts(con):
+    # Sources that often return 0 results — don't alert for these
+    SILENT_SOURCES = {"GoogleNews-EN"}
     cur = con.cursor()
     cur.execute("SELECT source_name, consecutive_fails, last_success_utc FROM source_health WHERE consecutive_fails >= 3")
     return [
         f"⚠️ <b>{html.escape(name)}</b> returned 0 articles {fails}x in a row. Last OK: {html.escape(last_ok or 'never')}"
         for name, fails, last_ok in cur.fetchall()
+        if name not in SILENT_SOURCES
     ]
 
 
