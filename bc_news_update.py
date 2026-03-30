@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BC News Monitor v3.0
+BC News Monitor v3.1
 ====================
 Usage:
   python bc_news_update.py              # Normal run (fetch + alert)
@@ -20,6 +20,7 @@ Features:
   - Weekly leaderboard (sources & topics)
   - PDF weekly report (auto-generated)
   - Telegram inline buttons + bot commands
+  - Two-layer relevance filter (query + post-fetch)  [v3.1]
 """
 
 import os
@@ -41,18 +42,27 @@ from collections import Counter
 # =========================
 DB_FILE = "seen.sqlite"
 
-# Indonesian queries
-QUERY_RSS_ID = 'bea cukai OR DJBC OR Kemenkeu OR "Kementerian Keuangan" when:24h'
+# ── CHANGE 1: Tighter Google News queries ────────────────────────────────────
+# Removed standalone "Kemenkeu" / "Kementerian Keuangan" which caught
+# APBN, OJK, bond, and tax articles with no customs context.
+QUERY_RSS_ID = (
+    '"bea cukai" OR "DJBC" OR "kepabeanan" OR "bea masuk" '
+    'OR "penyelundupan" OR "cukai rokok" OR "kawasan berikat" '
+    'OR "KPPBC" OR "Kanwil DJBC" when:24h'
+)
 
 # English queries (international coverage)
-QUERY_RSS_EN = '("Indonesia customs" OR "Indonesia tariff" OR "DGCE Indonesia" OR "Indonesia trade policy" OR "Indonesia import export") when:24h'
+QUERY_RSS_EN = (
+    '("Indonesia customs" OR "Indonesia tariff" OR "DGCE Indonesia" '
+    'OR "Indonesia trade policy" OR "Indonesia import export") when:24h'
+)
+# ─────────────────────────────────────────────────────────────────────────────
 
 MAX_AGE_HOURS = 24
 
 GOOGLE_RSS_SIZE = 30
 
 # Direct RSS feeds (faster than Google News aggregation)
-# These are fetched alongside Google News RSS; dedup handles overlaps
 DIRECT_RSS_FEEDS = {
     "Antara-BC": "https://www.antaranews.com/rss/topik/bea-cukai.xml",
     "Antara-Ekonomi": "https://www.antaranews.com/rss/ekonomi.xml",
@@ -64,15 +74,85 @@ DIRECT_RSS_FEEDS = {
     "Tempo-Bisnis": "https://rss.tempo.co/bisnis",
 }
 
-# Keywords to filter direct RSS articles (must match at least one)
+# ── CHANGE 3: Tighter direct RSS keywords ────────────────────────────────────
+# Removed standalone "impor", "ekspor", "tarif" which matched thousands of
+# unrelated trade/economics articles. Now requires customs-specific context.
 DIRECT_RSS_KEYWORDS = [
-    "bea cukai", "djbc", "kemenkeu", "kementerian keuangan",
-    "cukai", "kepabeanan", "impor", "ekspor", "tarif",
+    "bea cukai", "djbc", "kepabeanan",
+    "cukai", "bea masuk", "bea keluar",
     "penyelundupan", "smuggling", "customs",
-    "bea masuk", "penindakan", "penerimaan negara",
-    "kawasan berikat", "plb", "kite",
-    "sri mulyani", "menkeu",
+    "pita cukai", "rokok ilegal", "miras ilegal",
+    "kawasan berikat", "plb", "kite", "gudang berikat",
+    "kppbc", "kanwil djbc", "kantor bea",
+    "narkoba bea",              # enforcement context
+    "tarif bea",                # not just "tarif" alone
+    "impor ilegal", "ekspor ilegal",  # not just "impor" alone
+    "barang selundupan", "barang ilegal",
+    "pengawasan kepabeanan",
 ]
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── CHANGE 2: Post-fetch relevance filter (applied to ALL sources) ────────────
+# Google News results had zero filtering — these two lists fix that.
+
+RELEVANCE_REQUIRED_KEYWORDS = [
+    # Core BC terms
+    "bea cukai", "djbc", "kepabeanan", "cukai",
+    "bea masuk", "bea keluar", "penyelundupan", "smuggling",
+    "kawasan berikat", "plb", "kite", "gudang berikat",
+    "kppbc", "kanwil djbc", "kantor bea",
+    # Enforcement
+    "pita cukai", "rokok ilegal", "miras ilegal",
+    "narkoba bea", "penindakan bea", "sitaan bea",
+    # Trade-policy with customs angle
+    "tarif bea", "bea anti dumping", "safeguard bea",
+    "impor ilegal", "ekspor ilegal", "barang selundupan",
+    # English
+    "indonesia customs", "customs indonesia",
+    "dgce", "directorate general of customs",
+    "customs excise indonesia",
+]
+
+RELEVANCE_BLOCKLIST = [
+    # Tax / fiscal topics with no customs link
+    "pajak penghasilan", "pph 21", "pph badan", "pph pasal",
+    "ppn masukan", "ppn keluaran",
+    # Financial regulators
+    "ojk", "otoritas jasa keuangan",
+    "bank indonesia", "bi rate", "suku bunga acuan",
+    # Government securities / budget (no customs angle)
+    "sbsn", "sbn", "obligasi negara", "surat utang negara",
+    "defisit anggaran", "utang negara", "apbn murni",
+    # Capital markets
+    "saham", "ihsg", "bursa efek indonesia", "pasar modal",
+    # SOEs unrelated to trade
+    "pln listrik", "pertamina bbm",
+]
+
+
+def is_relevant(title: str, description: str = "") -> bool:
+    """
+    Two-layer relevance check for ALL fetched items.
+
+    Layer 1 — must match at least one RELEVANCE_REQUIRED_KEYWORDS.
+    Layer 2 — reject if blocklist terms dominate over relevant hits
+              (catches articles that mention bea cukai once in a
+               budget table but are really about APBN/OJK/etc.).
+    """
+    text = f"{title} {description}".lower()
+
+    relevant_hits = sum(1 for kw in RELEVANCE_REQUIRED_KEYWORDS if kw in text)
+    if relevant_hits == 0:
+        return False
+
+    blocklist_hits = sum(1 for kw in RELEVANCE_BLOCKLIST if kw in text)
+    # Reject if blocklist terms equal or outnumber relevant hits
+    # AND there's only a weak relevant signal (1 hit)
+    if blocklist_hits > 0 and relevant_hits < 2 and blocklist_hits >= relevant_hits:
+        return False
+
+    return True
+# ─────────────────────────────────────────────────────────────────────────────
 
 MAX_ITEMS_PER_BATCH = 1
 SEND_HEARTBEAT = True
@@ -87,7 +167,6 @@ TRENDING_THRESHOLD = 4
 TRENDING_WINDOW_HOURS = 3
 
 # Fuzzy dedup: Jaccard similarity threshold (0.0 - 1.0)
-# Headlines with similarity >= this are considered the same story
 DEDUP_SIMILARITY_THRESHOLD = 0.40
 
 # Export
@@ -208,13 +287,11 @@ _STOPWORDS = {
 
 
 def _tokenize(text: str) -> set:
-    """Tokenize text into meaningful words, removing stopwords and short tokens."""
     text = re.sub(r"[^\w\s]", " ", text.lower())
     return {t for t in text.split() if len(t) > 2 and t not in _STOPWORDS}
 
 
 def jaccard_similarity(title_a: str, title_b: str) -> float:
-    """Calculate Jaccard similarity between two headlines."""
     set_a = _tokenize(title_a)
     set_b = _tokenize(title_b)
     if not set_a or not set_b:
@@ -223,7 +300,6 @@ def jaccard_similarity(title_a: str, title_b: str) -> float:
 
 
 def find_similar_articles(item: dict, other_items: list) -> list:
-    """Find articles with similar headlines (fuzzy dedup)."""
     title = item.get("title", "")
     similar = []
     for other in other_items:
@@ -236,12 +312,8 @@ def find_similar_articles(item: dict, other_items: list) -> list:
 
 
 def deduplicate_fuzzy(items: list) -> list:
-    """
-    Remove fuzzy duplicates: keep the first occurrence, mark later ones as dupes.
-    Returns list of unique items with 'also_covered_by' field added.
-    """
     unique = []
-    seen_titles = []  # (title, index_in_unique)
+    seen_titles = []
 
     for it in items:
         title = it.get("title", "")
@@ -250,7 +322,6 @@ def deduplicate_fuzzy(items: list) -> list:
         for prev_title, idx in seen_titles:
             sim = jaccard_similarity(title, prev_title)
             if sim >= DEDUP_SIMILARITY_THRESHOLD:
-                # It's a dupe — add cross-reference to the original
                 src = it.get("source", "?")
                 unique[idx].setdefault("also_covered_by", []).append(src)
                 is_dupe = True
@@ -315,7 +386,6 @@ def make_fingerprint(url: str, title: str) -> str:
 
 
 def init_db(con: sqlite3.Connection):
-    """Init DB with v3 schema: seen + source_health + bot_state tables."""
     cur = con.cursor()
 
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='seen'")
@@ -375,7 +445,6 @@ def init_db(con: sqlite3.Connection):
                     cur.execute(f"ALTER TABLE seen ADD COLUMN {col_name} {col_type}")
                     print(f"  ➕ Added column: seen.{col_name}")
 
-    # source_health table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS source_health (
             source_name TEXT PRIMARY KEY,
@@ -387,7 +456,6 @@ def init_db(con: sqlite3.Connection):
         )
     """)
 
-    # bot_state table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
             key TEXT PRIMARY KEY,
@@ -395,7 +463,6 @@ def init_db(con: sqlite3.Connection):
         )
     """)
 
-    # reactions table (article votes from group members)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reactions (
             fingerprint TEXT,
@@ -406,7 +473,6 @@ def init_db(con: sqlite3.Connection):
         )
     """)
 
-    # Cleanup: remove old NewsAPI entries from source_health
     cur.execute("DELETE FROM source_health WHERE source_name LIKE '%NewsAPI%'")
 
     con.commit()
@@ -459,7 +525,6 @@ def record_source_health(con, source_name, article_count):
 
 
 def check_source_health_alerts(con):
-    # Sources that often return 0 results — don't alert for these
     SILENT_SOURCES = {"GoogleNews-EN"}
     cur = con.cursor()
     cur.execute("SELECT source_name, consecutive_fails, last_success_utc FROM source_health WHERE consecutive_fails >= 3")
@@ -581,7 +646,6 @@ def make_hashtags(title: str, url: str = ""):
         (["zona integritas"], "#ZonaIntegritas"),
         (["reformasi birokrasi"], "#ReformasiBirokrasi"),
         (["pengawasan"], "#Pengawasan"),
-        # English-specific
         (["trade war", "trade tension"], "#TradeWar"),
         (["sanctions", "embargo"], "#Sanctions"),
     ]
@@ -667,7 +731,6 @@ def build_inline_keyboard(buttons):
 # TRENDING DETECTION
 # =========================
 def detect_trending(con):
-    """Check if any hashtag has spiked in the last TRENDING_WINDOW_HOURS."""
     cur = con.cursor()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=TRENDING_WINDOW_HOURS)).isoformat()
 
@@ -695,11 +758,9 @@ def detect_trending(con):
 
 
 def send_trending_alert(session, trending_topics, con=None, force=False):
-    """Send a trending alert if any topics are spiking. Respects cooldown unless force=True."""
     if not trending_topics:
         return
 
-    # Cooldown: only send every 2 hours (skip if force=True, e.g. from /trending command)
     TRENDING_COOLDOWN_HOURS = 2
     if con and not force:
         last_sent = get_bot_state(con, "trending_last_sent")
@@ -728,7 +789,6 @@ def send_trending_alert(session, trending_topics, con=None, force=False):
     for part in chunk_text(text):
         telegram_send(session, part)
 
-    # Update cooldown timestamp
     if con:
         set_bot_state(con, "trending_last_sent", datetime.now(timezone.utc).isoformat())
 
@@ -736,17 +796,10 @@ def send_trending_alert(session, trending_topics, con=None, force=False):
 # =========================
 # SENTIMENT SHIFT DETECTION
 # =========================
-# Shift detection runs once per day (tracked via bot_state)
-SENTIMENT_SHIFT_THRESHOLD = 0.25  # alert if sentiment ratio shifts by >= 25%
+SENTIMENT_SHIFT_THRESHOLD = 0.25
 
 
 def detect_sentiment_shift(con) -> str | None:
-    """
-    Compare this week's sentiment distribution vs last week.
-    Returns alert message string if significant shift detected, else None.
-    Only fires once per day to avoid spam.
-    """
-    # Check if we already sent a shift alert today
     today_key = f"shift_alert_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
     if get_bot_state(con, today_key):
         return None
@@ -756,24 +809,20 @@ def detect_sentiment_shift(con) -> str | None:
     this_week_start = (now_utc - timedelta(days=7)).isoformat()
     last_week_start = (now_utc - timedelta(days=14)).isoformat()
 
-    # This week
     cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label",
                 (this_week_start,))
     tw = dict(cur.fetchall())
     tw_total = sum(tw.values())
 
-    # Last week
     cur.execute(
         "SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc < ? GROUP BY sentiment_label",
         (last_week_start, this_week_start))
     lw = dict(cur.fetchall())
     lw_total = sum(lw.values())
 
-    # Need enough data
     if tw_total < 5 or lw_total < 5:
         return None
 
-    # Calculate ratios
     tw_pos_ratio = tw.get("Positif", 0) / tw_total
     tw_neg_ratio = tw.get("Negatif", 0) / tw_total
     lw_pos_ratio = lw.get("Positif", 0) / lw_total
@@ -799,7 +848,6 @@ def detect_sentiment_shift(con) -> str | None:
     if not alerts:
         return None
 
-    # Mark as sent today
     set_bot_state(con, today_key, "1")
 
     lines = [
@@ -852,7 +900,6 @@ def _send_single_article(session, it):
     lines.append(f"{sent_emoji} Sentimen: <b>{sent_label}</b>")
     lines.append(f"🏷️ {tags_h}")
 
-    # Cross-reference: show if other sources also covered this story
     also_covered = it.get("also_covered_by", [])
     if also_covered:
         sources_str = ", ".join(html.escape(s) for s in also_covered[:3])
@@ -860,10 +907,8 @@ def _send_single_article(session, it):
 
     text = "\n".join(lines)
 
-    # Generate fingerprint for reaction tracking
     fp = make_fingerprint(url, title)
 
-    # Build inline keyboard: URL buttons on top, reaction buttons below
     keyboard = []
     url_row = []
     if url:
@@ -874,7 +919,6 @@ def _send_single_article(session, it):
     if url_row:
         keyboard.append(url_row)
 
-    # Reaction row (callback buttons)
     keyboard.append([
         {"text": "👍 Relevan", "callback_data": f"react:{fp[:16]}:up"},
         {"text": "👎 Tidak", "callback_data": f"react:{fp[:16]}:down"},
@@ -914,13 +958,11 @@ def fetch_google_news_rss(session, query, language="id"):
 # DIRECT RSS FEEDS
 # =========================
 def _matches_direct_keywords(title: str, description: str = "") -> bool:
-    """Check if article matches any BC-related keyword (for filtering general feeds)."""
     text = f"{title} {description}".lower()
     return any(kw in text for kw in DIRECT_RSS_KEYWORDS)
 
 
 def fetch_direct_rss(session):
-    """Fetch from all configured direct RSS feeds, filtering by keywords."""
     all_items = []
 
     for feed_name, feed_url in DIRECT_RSS_FEEDS.items():
@@ -931,7 +973,6 @@ def fetch_direct_rss(session):
                 title = (entry.get("title") or "").strip()
                 description = (entry.get("summary") or entry.get("description") or "").strip()
 
-                # Filter: only keep articles matching BC keywords
                 if not _matches_direct_keywords(title, description):
                     continue
 
@@ -943,7 +984,7 @@ def fetch_direct_rss(session):
                     "title": title,
                     "summary": description,
                     "description": description,
-                    "url": norm_url(link),  # skip resolve for speed on direct feeds
+                    "url": norm_url(link),
                     "published_utc": pub,
                     "language": "id",
                 })
@@ -968,18 +1009,25 @@ def cmd_run():
         now_utc = datetime.now(timezone.utc)
         cutoff = now_utc - timedelta(hours=MAX_AGE_HOURS)
 
-        # Fetch Google News RSS (Indonesian + English)
         rss_id = fetch_google_news_rss(session, QUERY_RSS_ID, language="id")
         record_source_health(con, "GoogleNews-ID", len(rss_id))
 
         rss_en = fetch_google_news_rss(session, QUERY_RSS_EN, language="en")
         record_source_health(con, "GoogleNews-EN", len(rss_en))
 
-        # Fetch direct RSS feeds
         direct_items = fetch_direct_rss(session)
         record_source_health(con, "DirectRSS", len(direct_items))
 
         items = rss_id + rss_en + direct_items
+
+        # ── CHANGE 2: Apply relevance filter to ALL items ─────────────────────
+        pre_filter_count = len(items)
+        items = [it for it in items
+                 if is_relevant(it.get("title", ""), it.get("description", ""))]
+        filtered_out = pre_filter_count - len(items)
+        print(f"Relevance filter: {filtered_out} dropped, {len(items)} kept "
+              f"({pre_filter_count} total fetched)")
+        # ─────────────────────────────────────────────────────────────────────
 
         # Deduplicate by fingerprint
         by_fp = {}
@@ -998,7 +1046,6 @@ def cmd_run():
                        key=lambda x: x.get("published_utc") or datetime.min.replace(tzinfo=timezone.utc),
                        reverse=True)
 
-        # Fuzzy dedup: catch similar headlines across sources
         pre_fuzzy = len(items)
         items = deduplicate_fuzzy(items)
         fuzzy_deduped = pre_fuzzy - len(items)
@@ -1043,20 +1090,16 @@ def cmd_run():
 
         send_updates_batched(session, new_items)
 
-        # Trending detection (with 2-hour cooldown)
         trending = detect_trending(con)
         send_trending_alert(session, trending, con=con)
 
-        # Sentiment shift alert (compare today vs 7-day average)
         shift_alert = detect_sentiment_shift(con)
         if shift_alert:
             telegram_send(session, shift_alert)
 
-        # Source health alerts
         for alert in check_source_health_alerts(con):
             telegram_send(session, alert)
 
-        # Heartbeat
         if SEND_HEARTBEAT:
             sent_summary = " | ".join(
                 f"{emoji} {label}: {sent_counts.get(label, 0)}"
@@ -1064,17 +1107,19 @@ def cmd_run():
             lang_summary = f"🇮🇩 {lang_counts.get('id', 0)} | 🌐 {lang_counts.get('en', 0)}"
             trend_note = f" | 🔥 Trending: {len(trending)}" if trending else ""
             dedup_note = f" | 🔁 Dedup: {fuzzy_deduped}" if fuzzy_deduped > 0 else ""
+            filter_note = f" | 🚫 Filtered: {filtered_out}" if filtered_out > 0 else ""
             telegram_send(
                 session,
                 f"✅ BC monitor OK\n"
                 f"📊 New: {len(new_items)} | Seen: {seen_skip} | Old: {too_old} | No-date: {no_date}\n"
                 f"💡 Sentimen: {sent_summary}\n"
-                f"🌍 Bahasa: {lang_summary}{trend_note}{dedup_note}\n"
+                f"🌍 Bahasa: {lang_summary}{trend_note}{dedup_note}{filter_note}\n"
                 f"📡 Sources: GNews-ID {len(rss_id)} | GNews-EN {len(rss_en)} | Direct {len(direct_items)}\n"
                 f"⏱️ Window: {MAX_AGE_HOURS}h")
 
         print(f"Done. New={len(new_items)}, seen={seen_skip}, old={too_old}, no_date={no_date}, "
-              f"fetched={len(items)}, fuzzy_deduped={fuzzy_deduped}, lang={lang_counts}, trending={len(trending)}")
+              f"fetched={pre_filter_count}, filtered={filtered_out}, kept={len(items)}, "
+              f"fuzzy_deduped={fuzzy_deduped}, lang={lang_counts}, trending={len(trending)}")
 
     except Exception as e:
         err = f"❌ BC monitor FAILED: {type(e).__name__}: {e}"
@@ -1171,7 +1216,6 @@ def cmd_stats():
         cur.execute("SELECT language, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY language", (week_cut,))
         wk_lang = dict(cur.fetchall())
 
-        # Top hashtags
         cur.execute("SELECT hashtags FROM seen WHERE first_seen_utc >= ?", (week_cut,))
         tag_counter = Counter()
         for (t,) in cur.fetchall():
@@ -1180,11 +1224,9 @@ def cmd_stats():
                     tag_counter[tag] += 1
         top_tags = tag_counter.most_common(10)
 
-        # Top sources
         cur.execute("SELECT source, COUNT(*) c FROM seen WHERE first_seen_utc >= ? GROUP BY source ORDER BY c DESC LIMIT 10", (week_cut,))
         top_sources = cur.fetchall()
 
-        # Daily trend
         daily = []
         for d in range(6, -1, -1):
             ds = (now_utc - timedelta(days=d)).replace(hour=0, minute=0, second=0).isoformat()
@@ -1192,13 +1234,11 @@ def cmd_stats():
             cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc <= ?", (ds, de))
             daily.append(((now_utc - timedelta(days=d)).strftime("%a"), cur.fetchone()[0]))
 
-        # Monthly
         cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ?", (month_cut,))
         mo_total = cur.fetchone()[0]
         cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label", (month_cut,))
         mo_sent = dict(cur.fetchall())
 
-        # Health
         cur.execute("SELECT source_name, consecutive_fails, total_fetches, total_articles FROM source_health")
         health_rows = cur.fetchall()
 
@@ -1267,7 +1307,6 @@ def cmd_leaderboard():
         this_week_cut = (now_utc - timedelta(days=7)).isoformat()
         last_week_cut = (now_utc - timedelta(days=14)).isoformat()
 
-        # --- Source leaderboard ---
         cur.execute("SELECT source, COUNT(*) c FROM seen WHERE first_seen_utc >= ? GROUP BY source ORDER BY c DESC LIMIT 10",
                     (this_week_cut,))
         src_this = cur.fetchall()
@@ -1276,7 +1315,6 @@ def cmd_leaderboard():
                     (last_week_cut, this_week_cut))
         src_last = dict(cur.fetchall())
 
-        # --- Topic leaderboard ---
         def get_tag_counts(cutoff_start, cutoff_end=None):
             if cutoff_end:
                 cur.execute("SELECT hashtags FROM seen WHERE first_seen_utc >= ? AND first_seen_utc < ?",
@@ -1293,7 +1331,6 @@ def cmd_leaderboard():
         tags_this = get_tag_counts(this_week_cut)
         tags_last = get_tag_counts(last_week_cut, this_week_cut)
 
-        # --- Sentiment trend ---
         cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label",
                     (this_week_cut,))
         sent_this = dict(cur.fetchall())
@@ -1301,16 +1338,13 @@ def cmd_leaderboard():
                     (last_week_cut, this_week_cut))
         sent_last = dict(cur.fetchall())
 
-        # --- Language breakdown ---
         cur.execute("SELECT language, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY language",
                     (this_week_cut,))
         lang_this = dict(cur.fetchall())
 
-        # Build message
         now_wib = now_utc.astimezone(WIB).strftime("%d %b %Y")
         lines = [f"🏆 <b>Weekly Leaderboard — {now_wib}</b>", ""]
 
-        # Source rankings
         lines.append("📰 <b>Top Sumber Berita:</b>")
         medals = ["🥇", "🥈", "🥉"]
         for i, (src, cnt) in enumerate(src_this[:10]):
@@ -1326,7 +1360,6 @@ def cmd_leaderboard():
                 trend = " ─"
             lines.append(f"{medal} {html.escape(src)}: {cnt}{trend}")
 
-        # Topic rankings with trend
         lines += ["", "🏷️ <b>Topik Terpanas:</b>"]
         for i, (tag, cnt) in enumerate(tags_this.most_common(10)):
             medal = medals[i] if i < 3 else f"  {i+1}."
@@ -1341,7 +1374,6 @@ def cmd_leaderboard():
                 trend = " ─"
             lines.append(f"{medal} {html.escape(tag)}: {cnt}{trend}")
 
-        # Rising topics (biggest increase)
         rising = []
         for tag in tags_this:
             diff = tags_this[tag] - tags_last.get(tag, 0)
@@ -1354,7 +1386,6 @@ def cmd_leaderboard():
             for tag, diff, total in rising[:5]:
                 lines.append(f"  {html.escape(tag)}: +{diff} (total: {total})")
 
-        # Falling topics
         falling = []
         for tag in tags_last:
             diff = tags_last[tag] - tags_this.get(tag, 0)
@@ -1367,7 +1398,6 @@ def cmd_leaderboard():
             for tag, diff, total in falling[:5]:
                 lines.append(f"  {html.escape(tag)}: -{diff} (total: {total})")
 
-        # Sentiment trend
         lines += ["", "📊 <b>Sentimen WoW:</b>"]
         for label, emoji in [("Positif", "🟢"), ("Negatif", "🔴"), ("Netral", "⚪")]:
             tw = sent_this.get(label, 0)
@@ -1376,7 +1406,6 @@ def cmd_leaderboard():
             arrow = f"↑{diff}" if diff > 0 else f"↓{abs(diff)}" if diff < 0 else "─"
             lines.append(f"  {emoji} {label}: {tw} ({arrow} vs minggu lalu)")
 
-        # Language
         lines += ["", f"🌍 <b>Bahasa:</b> 🇮🇩 {lang_this.get('id', 0)} | 🌐 {lang_this.get('en', 0)}"]
 
         for part in chunk_text("\n".join(lines), 3500):
@@ -1394,10 +1423,9 @@ def cmd_leaderboard():
 
 
 # =============================================================================
-# COMMAND: BACKFILL (re-process old articles)
+# COMMAND: BACKFILL
 # =============================================================================
 def _infer_source_from_url(url: str) -> str:
-    """Try to guess source name from URL domain."""
     if not url:
         return ""
     domain = urlsplit(url).netloc.lower()
@@ -1418,20 +1446,17 @@ def _infer_source_from_url(url: str) -> str:
     for key, name in domain_map.items():
         if key in domain:
             return name
-    # Fallback: use domain without TLD
     parts = domain.replace("www.", "").split(".")
     return parts[0].capitalize() if parts else ""
 
 
 def cmd_backfill():
-    """Re-process old articles: fill in missing source, sentiment, hashtags."""
     con = sqlite3.connect(DB_FILE)
     session = build_session()
     try:
         init_db(con)
         cur = con.cursor()
 
-        # Find articles missing data
         cur.execute("""SELECT fingerprint, url, title, summary, source, sentiment_label, hashtags
                        FROM seen WHERE source = '' OR sentiment_label = '' OR hashtags = ''""")
         rows = cur.fetchall()
@@ -1445,19 +1470,16 @@ def cmd_backfill():
         for fp, url, title, summary, source, sent_label, hashtags in rows:
             changes = {}
 
-            # Backfill source
             if not source:
                 inferred = _infer_source_from_url(url)
                 if inferred:
                     changes["source"] = inferred
 
-            # Backfill sentiment
             if not sent_label:
                 sentiment = analyze_sentiment(title or "", summary or "")
                 changes["sentiment_label"] = sentiment["label"]
                 changes["sentiment_score"] = sentiment["score"]
 
-            # Backfill hashtags
             if not hashtags:
                 tags_str = " ".join(make_hashtags(title or "", url or ""))
                 changes["hashtags"] = tags_str
@@ -1519,7 +1541,6 @@ def cmd_export(chat_id_override=None):
 # COMMAND: PDF WEEKLY REPORT
 # =============================================================================
 def cmd_report():
-    """Generate a PDF weekly report and send via Telegram."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1538,7 +1559,6 @@ def cmd_report():
         week_cut = (now_utc - timedelta(days=7)).isoformat()
         last_week_cut = (now_utc - timedelta(days=14)).isoformat()
 
-        # Gather data
         cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ?", (week_cut,))
         wk_total = cur.fetchone()[0]
 
@@ -1550,7 +1570,6 @@ def cmd_report():
                     (week_cut,))
         wk_lang = dict(cur.fetchall())
 
-        # Daily counts
         daily = []
         for d in range(6, -1, -1):
             day = now_utc - timedelta(days=d)
@@ -1559,12 +1578,10 @@ def cmd_report():
             cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc <= ?", (ds, de))
             daily.append((day.strftime("%a %d/%m"), cur.fetchone()[0]))
 
-        # Top sources
         cur.execute("SELECT source, COUNT(*) c FROM seen WHERE first_seen_utc >= ? GROUP BY source ORDER BY c DESC LIMIT 15",
                     (week_cut,))
         top_sources = cur.fetchall()
 
-        # Top tags
         cur.execute("SELECT hashtags FROM seen WHERE first_seen_utc >= ?", (week_cut,))
         tag_counter = Counter()
         for (t,) in cur.fetchall():
@@ -1573,7 +1590,6 @@ def cmd_report():
                     tag_counter[tag] += 1
         top_tags = tag_counter.most_common(15)
 
-        # Top articles by sentiment
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Positif' ORDER BY first_seen_utc DESC LIMIT 10",
                     (week_cut,))
         pos_articles = cur.fetchall()
@@ -1582,17 +1598,14 @@ def cmd_report():
                     (week_cut,))
         neg_articles = cur.fetchall()
 
-        # Source health
         cur.execute("SELECT source_name, consecutive_fails, total_fetches, total_articles FROM source_health")
         health_rows = cur.fetchall()
 
-        # ─── Build PDF ───
         doc = SimpleDocTemplate(REPORT_PDF_PATH, pagesize=A4,
                                 leftMargin=20*mm, rightMargin=20*mm,
                                 topMargin=20*mm, bottomMargin=20*mm)
         styles = getSampleStyleSheet()
 
-        # Custom styles
         styles.add(ParagraphStyle("SectionHead", parent=styles["Heading2"],
                                    textColor=colors.HexColor("#1565C0"), spaceAfter=8))
         styles.add(ParagraphStyle("SmallText", parent=styles["Normal"], fontSize=8, leading=10))
@@ -1600,7 +1613,6 @@ def cmd_report():
 
         story = []
 
-        # Title
         period_start = (now_utc - timedelta(days=7)).astimezone(WIB).strftime("%d %b")
         period_end = now_wib.strftime("%d %b %Y")
 
@@ -1608,7 +1620,6 @@ def cmd_report():
         story.append(Paragraph(f"Laporan Mingguan: {period_start} — {period_end}", styles["Heading3"]))
         story.append(Spacer(1, 10))
 
-        # Summary box
         summary_data = [
             ["Total Artikel", str(wk_total)],
             ["Bahasa Indonesia", str(wk_lang.get("id", 0))],
@@ -1631,7 +1642,6 @@ def cmd_report():
         story.append(t)
         story.append(Spacer(1, 15))
 
-        # Daily trend table
         story.append(Paragraph("Tren Harian", styles["SectionHead"]))
         daily_header = ["Hari"] + [d[0] for d in daily]
         daily_vals = ["Artikel"] + [str(d[1]) for d in daily]
@@ -1649,7 +1659,6 @@ def cmd_report():
         story.append(dt)
         story.append(Spacer(1, 15))
 
-        # Top sources table
         story.append(Paragraph("Top Sumber Berita", styles["SectionHead"]))
         src_data = [["#", "Sumber", "Jumlah"]]
         for i, (src, cnt) in enumerate(top_sources[:10]):
@@ -1670,7 +1679,6 @@ def cmd_report():
         story.append(st)
         story.append(Spacer(1, 15))
 
-        # Top topics table
         story.append(Paragraph("Topik Terbanyak", styles["SectionHead"]))
         tag_data = [["#", "Topik", "Jumlah"]]
         for i, (tag, cnt) in enumerate(top_tags[:10]):
@@ -1690,10 +1698,8 @@ def cmd_report():
         ]))
         story.append(tt)
 
-        # Page break for articles
         story.append(PageBreak())
 
-        # Positive articles
         if pos_articles:
             story.append(Paragraph("Artikel Positif (Enforcement & Capaian)", styles["SectionHead"]))
             for title, url, src, _ in pos_articles[:10]:
@@ -1702,7 +1708,6 @@ def cmd_report():
                 story.append(Spacer(1, 4))
             story.append(Spacer(1, 10))
 
-        # Negative articles
         if neg_articles:
             story.append(Paragraph("Artikel Negatif (Korupsi & Masalah)", styles["SectionHead"]))
             for title, url, src, _ in neg_articles[:10]:
@@ -1711,7 +1716,6 @@ def cmd_report():
                 story.append(Spacer(1, 4))
             story.append(Spacer(1, 10))
 
-        # Source health
         if health_rows:
             story.append(Paragraph("Source Health", styles["SectionHead"]))
             h_data = [["Source", "Status", "Avg/Fetch", "Total Fetch"]]
@@ -1731,16 +1735,14 @@ def cmd_report():
             ]))
             story.append(ht)
 
-        # Footer
         story.append(Spacer(1, 20))
         story.append(Paragraph(
-            f"<i>Generated: {now_wib.strftime('%d %b %Y %H:%M WIB')} — BC News Monitor v3.0</i>",
+            f"<i>Generated: {now_wib.strftime('%d %b %Y %H:%M WIB')} — BC News Monitor v3.1</i>",
             styles["SmallText"]))
 
         doc.build(story)
         print(f"✅ PDF report generated: {REPORT_PDF_PATH}")
 
-        # Send via Telegram
         telegram_send_document(session, REPORT_PDF_PATH,
                                caption=f"📄 Laporan Mingguan BC News — {period_start} s/d {period_end}")
         telegram_send(session, f"📄 <b>Laporan mingguan</b> telah dikirim ({wk_total} artikel, {period_start} - {period_end})")
@@ -1797,7 +1799,6 @@ def telegram_get_updates(session, offset=None):
 # REACTION HANDLING
 # =========================
 def save_reaction(con, fingerprint_short, user_id, reaction):
-    """Save or update a user's reaction. fingerprint_short is first 16 chars."""
     cur = con.cursor()
     now = datetime.now(timezone.utc).isoformat()
     cur.execute("SELECT fingerprint FROM seen WHERE fingerprint LIKE ?", (fingerprint_short + "%",))
@@ -1830,7 +1831,6 @@ def telegram_answer_callback(session, callback_query_id, text=""):
 
 
 def handle_callback_query(session, callback_query, con):
-    """Process a reaction button press."""
     cb_id = callback_query.get("id", "")
     data = callback_query.get("data", "")
     user = callback_query.get("from", {})
@@ -1973,7 +1973,7 @@ def handle_bot_command(session, command, chat_id, con):
     try:
         cmd = command.strip().lower().split("@")[0]
         if cmd in ("/start", "/help"):
-            lines = ["🛃 <b>BC News Bot v3 — Commands</b>\n"]
+            lines = ["🛃 <b>BC News Bot v3.1 — Commands</b>\n"]
             for c, desc in TELEGRAM_COMMANDS.items():
                 lines.append(f"  {c} — {desc}")
             lines.append("\n💡 Bot checks commands every 5 min.")
@@ -2068,7 +2068,6 @@ def cmd_poll():
         for update in updates:
             update_id = update.get("update_id", 0)
 
-            # Handle callback queries (reaction button presses)
             cb = update.get("callback_query")
             if cb:
                 try:
@@ -2079,7 +2078,6 @@ def cmd_poll():
                 set_bot_state(con, "tg_update_offset", str(update_id + 1))
                 continue
 
-            # Handle text messages (commands)
             msg = update.get("message", {})
             text = (msg.get("text") or "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -2146,7 +2144,6 @@ DASHBOARD_HTML_PATH = "docs/index.html"
 
 
 def cmd_dashboard():
-    """Generate a static HTML dashboard with Chart.js from seen.sqlite."""
     con = sqlite3.connect(DB_FILE)
     try:
         init_db(con)
@@ -2154,7 +2151,6 @@ def cmd_dashboard():
         now_utc = datetime.now(timezone.utc)
         now_wib = now_utc.astimezone(WIB)
 
-        # ── Daily sentiment (30 days) ──
         daily_data = []
         for d in range(29, -1, -1):
             day = now_utc - timedelta(days=d)
@@ -2169,7 +2165,6 @@ def cmd_dashboard():
                 "Netral": counts.get("Netral", 0),
             })
 
-        # ── Source breakdown by domain (30 days) ──
         cur.execute("SELECT url FROM seen WHERE first_seen_utc >= ? AND url != ''",
                     ((now_utc - timedelta(days=30)).isoformat(),))
         domain_counter = Counter()
@@ -2177,13 +2172,11 @@ def cmd_dashboard():
             try:
                 netloc = urlsplit(url_val).netloc.lower().replace("www.", "")
                 if netloc:
-                    # Clean up: strip subdomains for common sites
                     domain_counter[netloc] += 1
             except Exception:
                 pass
         source_data = [{"source": d, "count": c} for d, c in domain_counter.most_common(15) if d]
 
-        # ── Topic heatmap (7 days x top 10 tags) ──
         week_cut = (now_utc - timedelta(days=7)).isoformat()
         cur.execute("SELECT hashtags FROM seen WHERE first_seen_utc >= ?", (week_cut,))
         tag_counter = Counter()
@@ -2209,7 +2202,6 @@ def cmd_dashboard():
                 row[tag] = day_tags.get(tag, 0)
             heatmap_data.append(row)
 
-        # ── Media tone by domain (7 days) ──
         cur.execute("SELECT url, sentiment_label FROM seen WHERE first_seen_utc >= ? AND url != '' AND sentiment_label != ''",
                     (week_cut,))
         tone_sources = {}
@@ -2227,14 +2219,13 @@ def cmd_dashboard():
 
         tone_data = []
         for src, data in tone_sources.items():
-            if data["total"] < 2 or not src:  # skip empty source names
+            if data["total"] < 2 or not src:
                 continue
             tone = round((data["Positif"] - data["Negatif"]) / data["total"], 2)
             tone_data.append({"source": src, "tone": tone, **data})
         tone_data.sort(key=lambda x: x["tone"], reverse=True)
         tone_data = tone_data[:12]
 
-        # ── Language split (30 days) ──
         lang_daily = []
         for d in range(29, -1, -1):
             day = now_utc - timedelta(days=d)
@@ -2248,7 +2239,6 @@ def cmd_dashboard():
                 "en": counts.get("en", 0),
             })
 
-        # ── Summary stats ──
         month_cut = (now_utc - timedelta(days=30)).isoformat()
         cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ?", (month_cut,))
         total_30d = cur.fetchone()[0]
@@ -2257,7 +2247,6 @@ def cmd_dashboard():
         cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label", (week_cut,))
         wk_sent = dict(cur.fetchall())
 
-        # ── Reactions stats ──
         cur.execute("""
             SELECT s.title, s.url,
                    SUM(CASE WHEN r.reaction='up' THEN 1 ELSE 0 END) ups,
@@ -2268,7 +2257,6 @@ def cmd_dashboard():
         reaction_data = [{"title": t or "", "url": u or "", "ups": up, "downs": dn}
                          for t, u, up, dn in cur.fetchall()]
 
-        # ── Week-over-week comparison ──
         last_week_cut = (now_utc - timedelta(days=14)).isoformat()
         cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc < ?",
                     (last_week_cut, week_cut))
@@ -2277,7 +2265,6 @@ def cmd_dashboard():
                     (last_week_cut, week_cut))
         lw_sent = dict(cur.fetchall())
 
-        # ── Top recent articles (positive & negative) ──
         def _extract_domain(url_val):
             try:
                 return urlsplit(url_val or "").netloc.lower().replace("www.", "") or ""
@@ -2289,19 +2276,16 @@ def cmd_dashboard():
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Negatif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
         top_negative = [{"title": t, "url": u, "source": _extract_domain(u) or s} for t, u, s, _ in cur.fetchall()]
 
-        # ── Recent headlines (all, last 50) ──
         cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
                        FROM seen WHERE first_seen_utc >= ? AND title != ''
                        ORDER BY first_seen_utc DESC LIMIT 50""", (week_cut,))
         recent_articles = []
         for title, url, source, sent, seen_utc, tags, lang in cur.fetchall():
-            # Format time to WIB
             try:
                 dt = datetime.fromisoformat(seen_utc).astimezone(WIB)
                 time_str = dt.strftime("%d/%m %H:%M")
             except Exception:
                 time_str = ""
-            # Extract domain as display source
             try:
                 display_src = urlsplit(url or "").netloc.lower().replace("www.", "") or source or ""
             except Exception:
@@ -2312,7 +2296,6 @@ def cmd_dashboard():
                 "tags": (tags or "").split()[:3], "lang": lang or "id",
             })
 
-        # ── Generate HTML ──
         dashboard_json = json.dumps({
             "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
             "summary": {
@@ -2344,7 +2327,6 @@ def cmd_dashboard():
 
         os.makedirs(os.path.dirname(DASHBOARD_HTML_PATH) or ".", exist_ok=True)
 
-        # Create .nojekyll so GitHub Pages serves raw HTML
         nojekyll_path = os.path.join(os.path.dirname(DASHBOARD_HTML_PATH), ".nojekyll")
         if not os.path.exists(nojekyll_path):
             open(nojekyll_path, "w").close()
@@ -2419,7 +2401,6 @@ def _build_dashboard_html(data_json: str) -> str:
   .reaction-votes {{ color: #94a3b8; font-size: 0.75rem; white-space: nowrap; }}
   .footer {{ text-align: center; color: #334155; font-size: 0.7rem; margin-top: 28px; padding: 12px;
              border-top: 1px solid #1e293b; }}
-  /* Headlines feed */
   .feed-controls {{ display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }}
   .feed-btn {{ background: #1e293b; border: 1px solid #1e3a5f; border-radius: 20px; color: #94a3b8;
                padding: 6px 14px; font-size: 0.75rem; cursor: pointer; font-family: inherit;
@@ -2453,7 +2434,6 @@ def _build_dashboard_html(data_json: str) -> str:
   </div>
   <div class="subtitle" id="generated"></div>
 
-  <!-- Summary Cards -->
   <div class="grid-3">
     <div class="card">
       <h2>Total Minggu Ini</h2>
@@ -2487,7 +2467,6 @@ def _build_dashboard_html(data_json: str) -> str:
     </div>
   </div>
 
-  <!-- Charts Row 1 -->
   <div class="grid">
     <div class="card">
       <h2>📈 Sentimen Harian (30 hari)</h2>
@@ -2499,7 +2478,6 @@ def _build_dashboard_html(data_json: str) -> str:
     </div>
   </div>
 
-  <!-- Charts Row 2 -->
   <div class="grid">
     <div class="card">
       <h2>📰 Top Sumber Berita</h2>
@@ -2511,13 +2489,11 @@ def _build_dashboard_html(data_json: str) -> str:
     </div>
   </div>
 
-  <!-- Heatmap -->
   <div class="card" style="margin-bottom:14px">
     <h2>🏷️ Topic Heatmap (7 hari)</h2>
     <div id="heatmapContainer" style="overflow-x:auto"></div>
   </div>
 
-  <!-- Headlines Feed -->
   <div class="card" style="margin-bottom:14px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
       <h2 style="margin-bottom:0">📰 Berita Terbaru</h2>
@@ -2532,7 +2508,6 @@ def _build_dashboard_html(data_json: str) -> str:
     <div id="feedContainer"></div>
   </div>
 
-  <!-- Articles Row -->
   <div class="grid">
     <div class="card">
       <h2>🟢 Berita Positif Terbaru</h2>
@@ -2544,19 +2519,17 @@ def _build_dashboard_html(data_json: str) -> str:
     </div>
   </div>
 
-  <!-- Reactions -->
   <div class="card" style="margin-bottom:14px">
     <h2>👍 Top Voted Articles</h2>
     <div id="reactionsContainer"></div>
   </div>
 
-  <div class="footer">BC News Monitor v3 — Auto-generated dashboard — Powered by Google News RSS</div>
+  <div class="footer">BC News Monitor v3.1 — Auto-generated dashboard — Powered by Google News RSS</div>
 </div>
 
 <script>
 const D = {data_json};
 
-// Helper
 function wowArrow(curr, prev) {{
   if (prev === 0) return '<span class="flat">— baru</span>';
   const diff = curr - prev;
@@ -2566,7 +2539,6 @@ function wowArrow(curr, prev) {{
   return '<span class="flat">— sama</span>';
 }}
 
-// Summary
 document.getElementById('generated').textContent = 'Last updated: ' + D.generated;
 document.getElementById('total7d').textContent = D.summary.total_7d;
 document.getElementById('total30d').textContent = D.summary.total_30d;
@@ -2575,17 +2547,14 @@ document.getElementById('neg7d').textContent = D.summary.negatif_7d;
 document.getElementById('neu7d').textContent = D.summary.netral_7d;
 document.getElementById('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
 
-// WoW
 document.getElementById('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
 document.getElementById('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
 document.getElementById('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
 
-// Chart defaults
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = '#1e3a5f';
 Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif';
 
-// Sentiment Line Chart
 new Chart(document.getElementById('sentimentChart'), {{
   type: 'line',
   data: {{
@@ -2604,7 +2573,6 @@ new Chart(document.getElementById('sentimentChart'), {{
     scales: {{ x: {{ ticks: {{ maxTicksLimit: 8, font: {{ size: 10 }} }} }}, y: {{ beginAtZero: true }} }} }}
 }});
 
-// Language Chart
 new Chart(document.getElementById('langChart'), {{
   type: 'bar',
   data: {{
@@ -2620,7 +2588,6 @@ new Chart(document.getElementById('langChart'), {{
                y: {{ stacked: true, beginAtZero: true }} }} }}
 }});
 
-// Source Bar Chart
 const srcColors = ['#6366f1','#8b5cf6','#a78bfa','#c4b5fd','#818cf8','#6366f1','#7c3aed','#5b21b6','#4f46e5','#4338ca','#3730a3','#312e81'];
 new Chart(document.getElementById('sourceChart'), {{
   type: 'bar',
@@ -2634,7 +2601,6 @@ new Chart(document.getElementById('sourceChart'), {{
     scales: {{ x: {{ beginAtZero: true }}, y: {{ ticks: {{ font: {{ size: 11 }} }} }} }} }}
 }});
 
-// Media Tone
 const toneEl = document.getElementById('toneContainer');
 if (D.tone.length) {{
   D.tone.forEach(d => {{
@@ -2651,7 +2617,6 @@ if (D.tone.length) {{
   toneEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada data</div>';
 }}
 
-// Heatmap
 const hmEl = document.getElementById('heatmapContainer');
 if (D.heatmap_tags.length && D.heatmap.length) {{
   const cols = D.heatmap_tags.length + 1;
@@ -2673,7 +2638,6 @@ if (D.heatmap_tags.length && D.heatmap.length) {{
   hmEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada data</div>';
 }}
 
-// Top Articles
 function renderArticles(containerId, articles, dotColor) {{
   const el = document.getElementById(containerId);
   if (!articles || !articles.length) {{
@@ -2691,7 +2655,6 @@ function renderArticles(containerId, articles, dotColor) {{
 renderArticles('posArticles', D.top_positive, '#4ade80');
 renderArticles('negArticles', D.top_negative, '#f87171');
 
-// Reactions
 const rxEl = document.getElementById('reactionsContainer');
 if (D.reactions.length) {{
   D.reactions.forEach(r => {{
@@ -2703,7 +2666,6 @@ if (D.reactions.length) {{
   rxEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada vote — tap 👍/👎 di Telegram</div>';
 }}
 
-// Headlines Feed
 const sentDotColor = {{'Positif': '#4ade80', 'Negatif': '#f87171', 'Netral': '#64748b'}};
 let currentFilter = 'all';
 
@@ -2711,14 +2673,11 @@ function renderFeed(filter) {{
   const el = document.getElementById('feedContainer');
   const countEl = document.getElementById('feedCount');
   const articles = filter === 'all' ? D.recent : D.recent.filter(a => a.sentiment === filter);
-
   countEl.textContent = articles.length + ' artikel';
-
   if (!articles.length) {{
     el.innerHTML = '<div class="feed-empty">Tidak ada artikel untuk filter ini</div>';
     return;
   }}
-
   el.innerHTML = articles.map(a => {{
     const dot = sentDotColor[a.sentiment] || '#64748b';
     const flag = a.lang === 'en' ? '🌐' : '';
