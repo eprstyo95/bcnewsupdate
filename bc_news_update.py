@@ -2246,6 +2246,14 @@ def cmd_dashboard():
         total_7d = cur.fetchone()[0]
         cur.execute("SELECT sentiment_label, COUNT(*) FROM seen WHERE first_seen_utc >= ? GROUP BY sentiment_label", (week_cut,))
         wk_sent = dict(cur.fetchall())
+        cur.execute("SELECT MAX(first_seen_utc) FROM seen")
+        last_seen_raw = cur.fetchone()[0]
+        last_seen_wib = ""
+        try:
+            if last_seen_raw:
+                last_seen_wib = datetime.fromisoformat(last_seen_raw).astimezone(WIB).strftime("%d %b %Y %H:%M WIB")
+        except Exception:
+            last_seen_wib = ""
 
         cur.execute("""
             SELECT s.title, s.url,
@@ -2296,6 +2304,22 @@ def cmd_dashboard():
                 "tags": (tags or "").split()[:3], "lang": lang or "id",
             })
 
+        cur.execute("""SELECT source_name, consecutive_fails, total_fetches, total_articles,
+                              last_success_utc, last_fail_utc
+                       FROM source_health ORDER BY source_name""")
+        source_health = []
+        for name, fails, fetches, articles, last_success, last_fail in cur.fetchall():
+            source_health.append({
+                "source": name or "",
+                "status": "warning" if (fails or 0) > 0 else "ok",
+                "fails": fails or 0,
+                "fetches": fetches or 0,
+                "articles": articles or 0,
+                "avg": round((articles or 0) / max(fetches or 0, 1), 1),
+                "last_success": last_success or "",
+                "last_fail": last_fail or "",
+            })
+
         dashboard_json = json.dumps({
             "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
             "summary": {
@@ -2304,6 +2328,7 @@ def cmd_dashboard():
                 "positif_7d": wk_sent.get("Positif", 0),
                 "negatif_7d": wk_sent.get("Negatif", 0),
                 "netral_7d": wk_sent.get("Netral", 0),
+                "last_seen": last_seen_wib,
             },
             "wow": {
                 "lw_total": lw_total,
@@ -2321,6 +2346,7 @@ def cmd_dashboard():
             "top_positive": top_positive,
             "top_negative": top_negative,
             "recent": recent_articles,
+            "source_health": source_health,
         }, ensure_ascii=False)
 
         html_content = _build_dashboard_html(dashboard_json)
@@ -2350,6 +2376,7 @@ def _build_dashboard_html(data_json: str) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'none'; base-uri 'self'; form-action 'none'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests">
 <title>BC News Monitor — Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
@@ -2420,6 +2447,22 @@ def _build_dashboard_html(data_json: str) -> str:
                    font-size: 0.65rem; }}
   .feed-empty {{ color: #334155; padding: 20px; text-align: center; }}
   .feed-count {{ color: #64748b; font-size: 0.75rem; margin-left: auto; }}
+  .toolbar {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }}
+  .search {{ flex: 1; min-width: 220px; background: #0f172a; border: 1px solid #1e3a5f;
+             border-radius: 12px; color: #e2e8f0; padding: 10px 12px; font: inherit; font-size: 0.82rem; }}
+  .search:focus {{ outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.18); }}
+  .insight-list {{ display: grid; gap: 10px; }}
+  .insight {{ display: flex; justify-content: space-between; gap: 12px; padding: 10px 0;
+              border-bottom: 1px solid #1e3a5f; font-size: 0.82rem; }}
+  .insight:last-child {{ border-bottom: none; }}
+  .insight span:first-child {{ color: #94a3b8; }}
+  .status-list {{ display: grid; gap: 8px; }}
+  .status-row {{ display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+                 padding: 8px 0; border-bottom: 1px solid #1e3a5f; font-size: 0.8rem; }}
+  .status-row:last-child {{ border-bottom: none; }}
+  .status-pill {{ border-radius: 999px; padding: 3px 8px; font-size: 0.68rem; font-weight: 700; }}
+  .status-ok {{ background: rgba(34,197,94,0.14); color: #86efac; }}
+  .status-warning {{ background: rgba(251,191,36,0.14); color: #fde68a; }}
   @media (max-width: 700px) {{
     .stat .num {{ font-size: 1.5rem; }}
     .grid {{ grid-template-columns: 1fr; }}
@@ -2489,6 +2532,17 @@ def _build_dashboard_html(data_json: str) -> str:
     </div>
   </div>
 
+  <div class="grid">
+    <div class="card">
+      <h2>Operational Snapshot</h2>
+      <div class="insight-list" id="insightContainer"></div>
+    </div>
+    <div class="card">
+      <h2>Source Health</h2>
+      <div class="status-list" id="sourceHealthContainer"></div>
+    </div>
+  </div>
+
   <div class="card" style="margin-bottom:14px">
     <h2>🏷️ Topic Heatmap (7 hari)</h2>
     <div id="heatmapContainer" style="overflow-x:auto"></div>
@@ -2499,11 +2553,14 @@ def _build_dashboard_html(data_json: str) -> str:
       <h2 style="margin-bottom:0">📰 Berita Terbaru</h2>
       <span class="feed-count" id="feedCount"></span>
     </div>
+    <div class="toolbar">
+      <input class="search" id="feedSearch" type="search" placeholder="Search title, source, or hashtag..." autocomplete="off">
+    </div>
     <div class="feed-controls">
-      <button class="feed-btn active" onclick="filterFeed('all')">Semua</button>
-      <button class="feed-btn" onclick="filterFeed('Positif')">🟢 Positif</button>
-      <button class="feed-btn" onclick="filterFeed('Negatif')">🔴 Negatif</button>
-      <button class="feed-btn" onclick="filterFeed('Netral')">⚪ Netral</button>
+      <button class="feed-btn active" data-filter="all" type="button">Semua</button>
+      <button class="feed-btn" data-filter="Positif" type="button">🟢 Positif</button>
+      <button class="feed-btn" data-filter="Negatif" type="button">🔴 Negatif</button>
+      <button class="feed-btn" data-filter="Netral" type="button">⚪ Netral</button>
     </div>
     <div id="feedContainer"></div>
   </div>
@@ -2530,6 +2587,20 @@ def _build_dashboard_html(data_json: str) -> str:
 <script>
 const D = {data_json};
 
+const byId = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({{
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}}[ch]));
+const safeUrl = (value) => {{
+  try {{
+    const url = new URL(String(value || '#'), window.location.href);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '#';
+  }} catch {{
+    return '#';
+  }}
+}};
+const empty = (text) => '<div style="color:#334155;padding:12px">' + esc(text) + '</div>';
+
 function wowArrow(curr, prev) {{
   if (prev === 0) return '<span class="flat">— baru</span>';
   const diff = curr - prev;
@@ -2539,17 +2610,17 @@ function wowArrow(curr, prev) {{
   return '<span class="flat">— sama</span>';
 }}
 
-document.getElementById('generated').textContent = 'Last updated: ' + D.generated;
-document.getElementById('total7d').textContent = D.summary.total_7d;
-document.getElementById('total30d').textContent = D.summary.total_30d;
-document.getElementById('pos7d').textContent = D.summary.positif_7d;
-document.getElementById('neg7d').textContent = D.summary.negatif_7d;
-document.getElementById('neu7d').textContent = D.summary.netral_7d;
-document.getElementById('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
+byId('generated').textContent = 'Last updated: ' + D.generated;
+byId('total7d').textContent = D.summary.total_7d;
+byId('total30d').textContent = D.summary.total_30d;
+byId('pos7d').textContent = D.summary.positif_7d;
+byId('neg7d').textContent = D.summary.negatif_7d;
+byId('neu7d').textContent = D.summary.netral_7d;
+byId('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
 
-document.getElementById('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
-document.getElementById('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
-document.getElementById('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
+byId('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
+byId('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
+byId('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
 
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = '#1e3a5f';
@@ -2603,18 +2674,18 @@ new Chart(document.getElementById('sourceChart'), {{
 
 const toneEl = document.getElementById('toneContainer');
 if (D.tone.length) {{
-  D.tone.forEach(d => {{
+  toneEl.innerHTML = D.tone.map(d => {{
     const maxBar = 140;
     const barW = Math.max(6, Math.abs(d.tone) * maxBar);
     const cls = d.tone >= 0 ? 'tone-pos' : 'tone-neg';
     const sign = d.tone >= 0 ? '+' : '';
-    toneEl.innerHTML += '<div class="tone-bar">' +
-      '<span class="name">' + d.source.slice(0,30) + '</span>' +
+    return '<div class="tone-bar">' +
+      '<span class="name">' + esc(String(d.source || '').slice(0,30)) + '</span>' +
       '<div class="bar ' + cls + '" style="width:' + barW + 'px"></div>' +
-      '<span class="val">' + sign + d.tone.toFixed(2) + ' (' + d.total + ' art)</span></div>';
-  }});
+      '<span class="val">' + sign + Number(d.tone || 0).toFixed(2) + ' (' + Number(d.total || 0) + ' art)</span></div>';
+  }}).join('');
 }} else {{
-  toneEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada data</div>';
+  toneEl.innerHTML = empty('Belum ada data');
 }}
 
 const hmEl = document.getElementById('heatmapContainer');
@@ -2622,9 +2693,9 @@ if (D.heatmap_tags.length && D.heatmap.length) {{
   const cols = D.heatmap_tags.length + 1;
   let grid = '<div class="heatmap" style="grid-template-columns: 72px repeat(' + (cols-1) + ', 1fr)">';
   grid += '<div class="heatmap-header"></div>';
-  D.heatmap_tags.forEach(t => {{ grid += '<div class="heatmap-header">' + t + '</div>'; }});
+  D.heatmap_tags.forEach(t => {{ grid += '<div class="heatmap-header">' + esc(t) + '</div>'; }});
   D.heatmap.forEach(row => {{
-    grid += '<div class="heatmap-header">' + row.date + '</div>';
+    grid += '<div class="heatmap-header">' + esc(row.date) + '</div>';
     D.heatmap_tags.forEach(tag => {{
       const v = row[tag] || 0;
       const opacity = v === 0 ? 0.03 : Math.min(0.15 + v * 0.012, 0.95);
@@ -2635,7 +2706,34 @@ if (D.heatmap_tags.length && D.heatmap.length) {{
   grid += '</div>';
   hmEl.innerHTML = grid;
 }} else {{
-  hmEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada data</div>';
+  hmEl.innerHTML = empty('Belum ada data');
+}}
+
+const insightEl = byId('insightContainer');
+const weekTotal = Math.max(Number(D.summary.total_7d || 0), 1);
+const negShare = Math.round((Number(D.summary.negatif_7d || 0) / weekTotal) * 100);
+const topTag = (D.heatmap_tags && D.heatmap_tags[0]) || '—';
+const topSourceItem = (D.sources || []).find(source => source.source);
+const topSource = topSourceItem ? topSourceItem.source : '—';
+insightEl.innerHTML = [
+  ['Last article seen', D.summary.last_seen || 'No article recorded yet'],
+  ['Negative share', negShare + '% of 7-day articles'],
+  ['Top topic', topTag],
+  ['Top source', topSource],
+].map(([label, value]) => '<div class="insight"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>').join('');
+
+const healthEl = byId('sourceHealthContainer');
+if (D.source_health && D.source_health.length) {{
+  healthEl.innerHTML = D.source_health.map(s => {{
+    const status = s.status === 'warning' ? 'warning' : 'ok';
+    const label = status === 'warning' ? `${{Number(s.fails || 0)}} fail` : 'ok';
+    return '<div class="status-row">' +
+      '<div><strong>' + esc(s.source || '-') + '</strong><div class="src">avg ' + esc(s.avg ?? 0) + ' articles/fetch</div></div>' +
+      '<span class="status-pill status-' + status + '">' + esc(label) + '</span>' +
+    '</div>';
+  }}).join('');
+}} else {{
+  healthEl.innerHTML = empty('Source health will appear after the monitor runs.');
 }}
 
 function renderArticles(containerId, articles, dotColor) {{
@@ -2644,35 +2742,40 @@ function renderArticles(containerId, articles, dotColor) {{
     el.innerHTML = '<li style="color:#334155;padding:8px 0">Belum ada data</li>';
     return;
   }}
-  articles.forEach(a => {{
+  el.innerHTML = articles.map(a => {{
     const t = (a.title || '').slice(0, 90);
     const s = (a.source || '').slice(0, 25);
-    el.innerHTML += '<li><div class="dot" style="background:' + dotColor + '"></div>' +
-      '<div><a href="' + (a.url || '#') + '" target="_blank">' + t + '</a>' +
-      '<div class="src">' + s + '</div></div></li>';
-  }});
+    return '<li><div class="dot" style="background:' + dotColor + '"></div>' +
+      '<div><a href="' + safeUrl(a.url) + '" target="_blank" rel="noopener noreferrer">' + esc(t) + '</a>' +
+      '<div class="src">' + esc(s) + '</div></div></li>';
+  }}).join('');
 }}
 renderArticles('posArticles', D.top_positive, '#4ade80');
 renderArticles('negArticles', D.top_negative, '#f87171');
 
 const rxEl = document.getElementById('reactionsContainer');
 if (D.reactions.length) {{
-  D.reactions.forEach(r => {{
-    rxEl.innerHTML += '<div class="reaction-item">' +
-      '<span class="reaction-votes">👍' + r.ups + ' 👎' + r.downs + '</span>' +
-      '<a href="' + r.url + '" target="_blank">' + r.title.slice(0, 80) + '</a></div>';
-  }});
+  rxEl.innerHTML = D.reactions.map(r => '<div class="reaction-item">' +
+      '<span class="reaction-votes">👍' + Number(r.ups || 0) + ' 👎' + Number(r.downs || 0) + '</span>' +
+      '<a href="' + safeUrl(r.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(r.title || '').slice(0, 80)) + '</a></div>'
+  ).join('');
 }} else {{
-  rxEl.innerHTML = '<div style="color:#334155;padding:12px">Belum ada vote — tap 👍/👎 di Telegram</div>';
+  rxEl.innerHTML = empty('Belum ada vote — tap 👍/👎 di Telegram');
 }}
 
 const sentDotColor = {{'Positif': '#4ade80', 'Negatif': '#f87171', 'Netral': '#64748b'}};
 let currentFilter = 'all';
+let currentSearch = '';
 
 function renderFeed(filter) {{
   const el = document.getElementById('feedContainer');
   const countEl = document.getElementById('feedCount');
-  const articles = filter === 'all' ? D.recent : D.recent.filter(a => a.sentiment === filter);
+  const query = currentSearch.trim().toLowerCase();
+  const allRecent = D.recent || [];
+  const articles = (filter === 'all' ? allRecent : allRecent.filter(a => a.sentiment === filter)).filter(a => {{
+    if (!query) return true;
+    return [a.title, a.source, a.sentiment, a.lang, ...(a.tags || [])].join(' ').toLowerCase().includes(query);
+  }});
   countEl.textContent = articles.length + ' artikel';
   if (!articles.length) {{
     el.innerHTML = '<div class="feed-empty">Tidak ada artikel untuk filter ini</div>';
@@ -2681,15 +2784,15 @@ function renderFeed(filter) {{
   el.innerHTML = articles.map(a => {{
     const dot = sentDotColor[a.sentiment] || '#64748b';
     const flag = a.lang === 'en' ? '🌐' : '';
-    const tags = (a.tags || []).map(t => '<span class="headline-tag">' + t + '</span>').join(' ');
+    const tags = (a.tags || []).map(t => '<span class="headline-tag">' + esc(t) + '</span>').join(' ');
     return '<div class="headline">' +
       '<div class="headline-top">' +
         '<div class="headline-dot" style="background:' + dot + '"></div>' +
-        '<a href="' + a.url + '" target="_blank">' + a.title.slice(0, 120) + '</a>' +
+        '<a href="' + safeUrl(a.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(a.title || '').slice(0, 120)) + '</a>' +
       '</div>' +
       '<div class="headline-meta">' +
-        '<span>📌 ' + a.source.slice(0, 25) + '</span>' +
-        '<span>🕒 ' + a.time + '</span>' +
+        '<span>📌 ' + esc(String(a.source || '').slice(0, 25)) + '</span>' +
+        '<span>🕒 ' + esc(a.time || '') + '</span>' +
         (flag ? '<span>' + flag + '</span>' : '') +
         tags +
       '</div>' +
@@ -2697,12 +2800,17 @@ function renderFeed(filter) {{
   }}).join('');
 }}
 
-function filterFeed(filter) {{
-  currentFilter = filter;
-  document.querySelectorAll('.feed-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
-  renderFeed(filter);
-}}
+document.querySelectorAll('.feed-btn').forEach(button => {{
+  button.addEventListener('click', () => {{
+    currentFilter = button.dataset.filter || 'all';
+    document.querySelectorAll('.feed-btn').forEach(b => b.classList.toggle('active', b === button));
+    renderFeed(currentFilter);
+  }});
+}});
+byId('feedSearch').addEventListener('input', (event) => {{
+  currentSearch = event.target.value || '';
+  renderFeed(currentFilter);
+}});
 
 renderFeed('all');
 </script>

@@ -1,0 +1,8 @@
+*.log
+*.sqlite
+*.sqlite-*
+bc_articles_export.csv
+bc_weekly_report.pdf
+.env
+.venv/
+__pycache__/

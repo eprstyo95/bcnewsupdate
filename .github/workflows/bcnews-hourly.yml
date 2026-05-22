@@ -7,6 +7,8 @@ on:
     branches: ["main"]
     paths-ignore:
       - "docs/**"
+permissions:
+  contents: write
 concurrency:
   group: bcnews-${{ github.ref_name }}
   cancel-in-progress: false
@@ -49,6 +51,20 @@ jobs:
           TELEGRAM_PRIVATE_CHAT_ID: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
         run: |
           python bc_news_update.py poll
+      - name: Generate dashboard
+        run: |
+          python bc_news_update.py dashboard
+      - name: Commit dashboard when changed
+        run: |
+          if git diff --quiet -- docs/index.html docs/.nojekyll; then
+            echo "Dashboard unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html docs/.nojekyll
+          git commit -m "Update BC news dashboard"
+          git push
       - name: Save seen database cache
         uses: actions/cache/save@v4
         with:
