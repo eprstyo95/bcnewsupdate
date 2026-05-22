@@ -65,6 +65,26 @@ jobs:
           git add docs/index.html docs/.nojekyll
           git commit -m "Update BC news dashboard"
           git push
+      - name: Sync dashboard to portal
+        continue-on-error: true
+        env:
+          PORTAL_TOKEN: ${{ secrets.PORTAL_DEPLOY_TOKEN }}
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${PORTAL_TOKEN}@github.com/eprstyo95/eprstyo95.github.io.git \
+            _portal_sync
+          cp docs/index.html _portal_sync/bcnews.html
+          cd _portal_sync
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bcnews.html
+          if git diff --cached --quiet; then
+            echo "bcnews.html unchanged – skip sync."
+          else
+            git commit -m "Auto-sync: BC news dashboard update"
+            git push
+          fi
+
       - name: Save seen database cache
         uses: actions/cache/save@v4
         with:
