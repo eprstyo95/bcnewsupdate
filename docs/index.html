@@ -90,9 +90,38 @@
   .status-pill { border-radius: 999px; padding: 3px 8px; font-size: 0.68rem; font-weight: 700; }
   .status-ok { background: rgba(34,197,94,0.14); color: #86efac; }
   .status-warning { background: rgba(251,191,36,0.14); color: #fde68a; }
+  .risk-card { background: linear-gradient(135deg, rgba(248,113,113,0.16), rgba(30,41,59,1)); }
+  .risk-score { font-size: 3rem; font-weight: 900; line-height: 1; }
+  .risk-label { display: inline-flex; margin-top: 8px; border-radius: 999px; padding: 4px 10px;
+                 background: rgba(248,113,113,0.14); color: #fecaca; font-size: 0.72rem; font-weight: 800; }
+  .metric-note { color: #94a3b8; font-size: 0.75rem; margin-top: 8px; line-height: 1.4; }
+  .list-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  .list-table th { color: #64748b; text-align: left; font-size: 0.68rem; text-transform: uppercase;
+                    letter-spacing: 0.5px; border-bottom: 1px solid #1e3a5f; padding: 8px 6px; }
+  .list-table td { border-bottom: 1px solid #1e3a5f; padding: 9px 6px; vertical-align: top; }
+  .list-table tr:last-child td { border-bottom: none; }
+  .list-table a { color: #bfdbfe; text-decoration: none; }
+  .list-table a:hover { color: #93c5fd; text-decoration: underline; }
+  .pill { display: inline-flex; border-radius: 999px; padding: 2px 8px; font-size: 0.68rem; font-weight: 800; }
+  .pill-high { background: rgba(248,113,113,0.16); color: #fecaca; }
+  .pill-medium { background: rgba(251,191,36,0.16); color: #fde68a; }
+  .pill-low { background: rgba(96,165,250,0.14); color: #bfdbfe; }
+  .cluster-list, .watch-list, .media-list { display: grid; gap: 10px; }
+  .cluster-item, .watch-item, .media-item { padding: 10px 0; border-bottom: 1px solid #1e3a5f; }
+  .cluster-item:last-child, .watch-item:last-child, .media-item:last-child { border-bottom: none; }
+  .item-top { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .item-title { font-weight: 800; color: #e2e8f0; }
+  .item-meta { color: #94a3b8; font-size: 0.72rem; margin-top: 4px; line-height: 1.35; }
+  .brief-box { width: 100%; min-height: 160px; resize: vertical; background: #0f172a; color: #dbeafe;
+                border: 1px solid #1e3a5f; border-radius: 12px; padding: 12px; font: inherit;
+                font-size: 0.8rem; line-height: 1.45; }
+  .copy-btn { margin-top: 10px; background: #2563eb; color: #fff; border: 0; border-radius: 10px;
+               padding: 8px 12px; font: inherit; font-size: 0.78rem; font-weight: 800; cursor: pointer; }
+  .copy-btn:hover { background: #1d4ed8; }
   @media (max-width: 700px) {
     .stat .num { font-size: 1.5rem; }
     .grid { grid-template-columns: 1fr; }
+    .list-table { font-size: 0.72rem; }
   }
 </style>
 </head>
@@ -103,6 +132,27 @@
     <div><h1>BC News Monitor</h1></div>
   </div>
   <div class="subtitle" id="generated"></div>
+
+  <div class="grid-3">
+    <div class="card risk-card">
+      <h2>Situation Risk</h2>
+      <div class="risk-score" id="riskScore">-</div>
+      <div class="risk-label" id="riskLabel">Loading</div>
+      <div class="metric-note" id="riskNote"></div>
+    </div>
+    <div class="card">
+      <h2>Top Issue</h2>
+      <div class="stat"><div class="num" style="font-size:1.45rem;color:#fbbf24" id="topIssue">-</div></div>
+      <div class="metric-note" id="spikeTopic"></div>
+    </div>
+    <div class="card">
+      <h2>Priority Signals</h2>
+      <div class="stat-row">
+        <div class="stat"><div class="num neg" id="highPriorityCount">-</div><div class="label">High priority</div></div>
+        <div class="stat"><div class="num" style="color:#93c5fd" id="majorMediaCount">-</div><div class="label">Major-media hits</div></div>
+      </div>
+    </div>
+  </div>
 
   <div class="grid-3">
     <div class="card">
@@ -139,9 +189,16 @@
 
   <div class="grid">
     <div class="card">
+      <h2>Risk Timeline (30 hari)</h2>
+      <canvas id="riskChart"></canvas>
+    </div>
+    <div class="card">
       <h2>📈 Sentimen Harian (30 hari)</h2>
       <canvas id="sentimentChart"></canvas>
     </div>
+  </div>
+
+  <div class="grid">
     <div class="card">
       <h2>🌍 Bahasa (30 hari)</h2>
       <canvas id="langChart"></canvas>
@@ -165,8 +222,41 @@
       <div class="insight-list" id="insightContainer"></div>
     </div>
     <div class="card">
-      <h2>Source Health</h2>
+      <h2>Data Quality / Source Health</h2>
       <div class="status-list" id="sourceHealthContainer"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Story Clusters</h2>
+      <div class="cluster-list" id="clusterContainer"></div>
+    </div>
+    <div class="card">
+      <h2>Watchlist</h2>
+      <div class="watch-list" id="watchlistContainer"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>Priority Articles</h2>
+    <div style="overflow-x:auto">
+      <table class="list-table">
+        <thead><tr><th>Priority</th><th>Topic</th><th>Article</th><th>Source</th><th>Why</th></tr></thead>
+        <tbody id="priorityTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Major Media</h2>
+      <div class="media-list" id="majorMediaContainer"></div>
+    </div>
+    <div class="card">
+      <h2>Copy Brief</h2>
+      <textarea class="brief-box" id="briefBox" readonly></textarea>
+      <button class="copy-btn" id="copyBriefBtn" type="button">Copy brief</button>
     </div>
   </div>
 
@@ -227,6 +317,91 @@ const safeUrl = (value) => {
   }
 };
 const empty = (text) => '<div style="color:#334155;padding:12px">' + esc(text) + '</div>';
+const priorityClass = (priority) => 'pill-' + String(priority || 'Low').toLowerCase();
+
+function deriveDashboardData() {
+  const recent = D.recent || [];
+  const negShare = Math.round((Number(D.summary.negatif_7d || 0) / Math.max(Number(D.summary.total_7d || 0), 1)) * 100);
+  const fallbackRisk = Math.min(100, Math.round(negShare * 1.4 + ((D.top_negative || []).length * 6)));
+  D.situation = D.situation || {
+    risk_score: fallbackRisk,
+    risk_label: fallbackRisk >= 70 ? 'High' : fallbackRisk >= 40 ? 'Medium' : 'Low',
+    top_issue: (D.heatmap_tags || [])[0] || 'No issue detected',
+    spike_topic: (D.heatmap_tags || [])[1] || 'No spike',
+    major_media_count: (D.major_media || []).reduce((sum, item) => sum + Number(item.articles || 0), 0),
+    high_priority_count: (D.priority_articles || []).filter(a => a.priority === 'High').length,
+  };
+  D.risk_daily = D.risk_daily || (D.daily_sentiment || []).map(row => ({
+    date: row.date,
+    score: Math.min(100, Math.round(Number(row.Negatif || 0) * 4 + Number(row.Netral || 0) * 0.2)),
+    negative: Number(row.Negatif || 0),
+    high: 0,
+  }));
+  const latestHeatmap = (D.heatmap || [])[Math.max((D.heatmap || []).length - 1, 0)] || {};
+  D.clusters = D.clusters || (D.heatmap_tags || []).slice(0, 6).map(tag => ({
+    topic: tag,
+    articles: (D.heatmap || []).reduce((sum, row) => sum + Number(row[tag] || 0), 0),
+    sources: 0,
+    negative: 0,
+    trend: 0,
+    latest: '',
+    url: '',
+    tone: 'mixed',
+  })).filter(item => item.articles > 0);
+  D.watchlist = D.watchlist || D.clusters.map(item => ({
+    topic: item.topic,
+    today: Number(latestHeatmap[item.topic] || 0),
+    week: item.articles,
+    prev_week: 0,
+    delta: item.trend,
+    latest: item.latest,
+    url: item.url,
+  }));
+  D.priority_articles = D.priority_articles || [...(D.top_negative || []), ...recent.filter(a => a.sentiment === 'Negatif')].slice(0, 12).map(a => ({
+    priority: 'Medium',
+    score: 45,
+    topic: (a.tags || [])[0] || 'Negative Coverage',
+    title: a.title || '',
+    url: a.url || '',
+    source: a.source || '',
+    sentiment: a.sentiment || 'Negatif',
+    time: a.time || '',
+    reason: 'Negative or watchlist coverage',
+  }));
+  D.situation.high_priority_count = D.situation.high_priority_count || D.priority_articles.filter(a => a.priority === 'High').length;
+  D.situation.major_media_count = D.situation.major_media_count || (D.major_media || []).reduce((sum, item) => sum + Number(item.articles || 0), 0);
+  if (!D.major_media) {
+    const majorNames = ['Kompas', 'Detik', 'Tempo', 'CNN Indonesia', 'CNBC Indonesia', 'Antara', 'Bisnis', 'Kontan', 'MetroTV', 'JPNN'];
+    D.major_media = majorNames.map(name => {
+      const hits = recent.filter(a => [a.title, a.source].join(' ').toLowerCase().includes(name.toLowerCase()));
+      return {
+        source: name,
+        articles: hits.length,
+        negative: hits.filter(a => a.sentiment === 'Negatif').length,
+        latest: hits[0]?.title || '',
+      };
+    }).filter(item => item.articles > 0);
+  }
+  D.situation.major_media_count = D.situation.major_media_count || D.major_media.reduce((sum, item) => sum + Number(item.articles || 0), 0);
+  D.data_quality = D.data_quality || {
+    sources_ok: (D.source_health || []).filter(s => s.status === 'ok').length,
+    sources_warning: (D.source_health || []).filter(s => s.status !== 'ok').length,
+    recent_articles: recent.length,
+    tracked_30d: D.summary.total_30d || 0,
+    last_seen: D.summary.last_seen || '',
+    dashboard_generated: D.generated || '',
+  };
+  D.copy_brief = D.copy_brief || [
+    'BC News Brief - ' + (D.generated || ''),
+    'Risk: ' + D.situation.risk_label + ' (' + D.situation.risk_score + '/100)',
+    '7d articles: ' + (D.summary.total_7d || 0) + ' | Negative: ' + (D.summary.negatif_7d || 0) + ' (' + negShare + '%)',
+    'Top issue: ' + D.situation.top_issue,
+    'Spike topic: ' + D.situation.spike_topic,
+    'Priority articles:',
+    ...D.priority_articles.slice(0, 5).map(a => '- [' + a.priority + '] ' + String(a.title || '').slice(0, 110)),
+  ].join('\n');
+}
+deriveDashboardData();
 
 function wowArrow(curr, prev) {
   if (prev === 0) return '<span class="flat">— baru</span>';
@@ -248,10 +423,36 @@ byId('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
 byId('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
 byId('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
 byId('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
+byId('riskScore').textContent = D.situation.risk_score;
+byId('riskLabel').textContent = D.situation.risk_label + ' attention';
+byId('riskNote').textContent = 'Negative share, high-priority items, major-media coverage, and rising clusters.';
+byId('topIssue').textContent = D.situation.top_issue;
+byId('spikeTopic').textContent = 'Spike topic: ' + D.situation.spike_topic;
+byId('highPriorityCount').textContent = D.situation.high_priority_count;
+byId('majorMediaCount').textContent = D.situation.major_media_count;
 
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = '#1e3a5f';
 Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif';
+
+new Chart(document.getElementById('riskChart'), {
+  type: 'line',
+  data: {
+    labels: D.risk_daily.map(d => d.date),
+    datasets: [
+      { label: 'Risk score', data: D.risk_daily.map(d => d.score),
+         borderColor: '#fb7185', backgroundColor: 'rgba(251,113,133,0.12)', fill: true,
+         tension: 0.35, borderWidth: 2, pointRadius: 0 },
+      { label: 'High priority', data: D.risk_daily.map(d => d.high),
+         borderColor: '#fbbf24', backgroundColor: 'rgba(251,191,36,0.08)', fill: false,
+         tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+    ]
+  },
+  options: { responsive: true, interaction: { intersect: false, mode: 'index' },
+    plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, padding: 16 } } },
+    scales: { x: { ticks: { maxTicksLimit: 8, font: { size: 10 } } },
+               y: { beginAtZero: true, suggestedMax: 100 } } }
+});
 
 new Chart(document.getElementById('sentimentChart'), {
   type: 'line',
@@ -362,6 +563,72 @@ if (D.source_health && D.source_health.length) {
 } else {
   healthEl.innerHTML = empty('Source health will appear after the monitor runs.');
 }
+if (D.data_quality) {
+  healthEl.innerHTML += '<div class="status-row">' +
+    '<div><strong>Dashboard data</strong><div class="src">' +
+    esc(D.data_quality.recent_articles || 0) + ' recent shown, ' + esc(D.data_quality.tracked_30d || 0) + ' tracked in 30d</div></div>' +
+    '<span class="status-pill status-ok">indexed</span></div>';
+}
+
+const clusterEl = byId('clusterContainer');
+if (D.clusters && D.clusters.length) {
+  clusterEl.innerHTML = D.clusters.map(c => '<div class="cluster-item">' +
+    '<div class="item-top"><span class="item-title">' + esc(c.topic) + '</span><span class="pill ' + (c.tone === 'negative' ? 'pill-high' : 'pill-medium') + '">' +
+    esc(c.articles) + ' articles</span></div>' +
+    '<div class="item-meta">' + esc(c.sources || 0) + ' sources | ' + esc(c.negative || 0) + ' negative | trend ' +
+    (Number(c.trend || 0) >= 0 ? '+' : '') + esc(c.trend || 0) + '</div>' +
+    (c.latest ? '<div class="item-meta"><a href="' + safeUrl(c.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(c.latest).slice(0, 120)) + '</a></div>' : '') +
+  '</div>').join('');
+} else {
+  clusterEl.innerHTML = empty('No active clusters yet.');
+}
+
+const watchEl = byId('watchlistContainer');
+if (D.watchlist && D.watchlist.length) {
+  watchEl.innerHTML = D.watchlist.slice(0, 9).map(w => '<div class="watch-item">' +
+    '<div class="item-top"><span class="item-title">' + esc(w.topic) + '</span><span class="pill pill-low">' +
+    esc(w.today || 0) + ' today</span></div>' +
+    '<div class="item-meta">' + esc(w.week || 0) + ' this week | ' + (Number(w.delta || 0) >= 0 ? '+' : '') + esc(w.delta || 0) + ' vs previous week</div>' +
+    (w.latest ? '<div class="item-meta"><a href="' + safeUrl(w.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(w.latest).slice(0, 120)) + '</a></div>' : '') +
+  '</div>').join('');
+} else {
+  watchEl.innerHTML = empty('No watchlist hits yet.');
+}
+
+const priorityEl = byId('priorityTable');
+if (D.priority_articles && D.priority_articles.length) {
+  priorityEl.innerHTML = D.priority_articles.map(a => '<tr>' +
+    '<td><span class="pill ' + priorityClass(a.priority) + '">' + esc(a.priority) + '</span><div class="item-meta">' + esc(a.score || 0) + '/100</div></td>' +
+    '<td>' + esc(a.topic || '-') + '<div class="item-meta">' + esc(a.time || '') + '</div></td>' +
+    '<td><a href="' + safeUrl(a.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(a.title || '').slice(0, 140)) + '</a></td>' +
+    '<td>' + esc(a.source || '-') + '<div class="item-meta">' + esc(a.sentiment || '') + '</div></td>' +
+    '<td>' + esc(a.reason || '') + '</td>' +
+  '</tr>').join('');
+} else {
+  priorityEl.innerHTML = '<tr><td colspan="5" style="color:#334155;padding:12px">No priority articles yet.</td></tr>';
+}
+
+const mediaEl = byId('majorMediaContainer');
+if (D.major_media && D.major_media.length) {
+  mediaEl.innerHTML = D.major_media.map(m => '<div class="media-item">' +
+    '<div class="item-top"><span class="item-title">' + esc(m.source) + '</span><span class="pill pill-low">' + esc(m.articles || 0) + ' articles</span></div>' +
+    '<div class="item-meta">' + esc(m.negative || 0) + ' negative mentions</div>' +
+    (m.latest ? '<div class="item-meta">' + esc(String(m.latest).slice(0, 120)) + '</div>' : '') +
+  '</div>').join('');
+} else {
+  mediaEl.innerHTML = empty('No major-media hits in this window.');
+}
+
+byId('briefBox').value = D.copy_brief || '';
+byId('copyBriefBtn').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(byId('briefBox').value);
+    byId('copyBriefBtn').textContent = 'Copied';
+  } catch {
+    byId('briefBox').select();
+    byId('copyBriefBtn').textContent = 'Select text to copy';
+  }
+});
 
 function renderArticles(containerId, articles, dotColor) {
   const el = document.getElementById(containerId);

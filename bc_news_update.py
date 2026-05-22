@@ -2151,6 +2151,99 @@ def cmd_dashboard():
         now_utc = datetime.now(timezone.utc)
         now_wib = now_utc.astimezone(WIB)
 
+        watch_topics = [
+            ("KPK / Korupsi", ["kpk", "korupsi", "suap", "gratifikasi", "tersangka", "amplop"]),
+            ("Dirjen / Pimpinan", ["dirjen", "direktur jenderal", "djaka", "pencopotan", "diganti"]),
+            ("Purbaya / Kemenkeu", ["purbaya", "menkeu", "kemenkeu", "menteri keuangan"]),
+            ("Rokok Ilegal", ["rokok ilegal", "pita cukai", "cukai palsu", "batang rokok"]),
+            ("Penyelundupan", ["penyelundupan", "selundup", "smuggling", "ilegal asal"]),
+            ("Narkoba / Sabu", ["narkoba", "narkotika", "sabu", "ganja", "kokain"]),
+            ("Kawasan Berikat", ["kawasan berikat", "gudang berikat", "plb", "kite"]),
+            ("Regulasi / Tarif", ["pmk", "tarif", "bea masuk", "regulasi", "aturan", "peraturan"]),
+            ("Penerimaan", ["penerimaan", "target", "realisasi", "miliar", "triliun"]),
+        ]
+        major_sources = {
+            "kompas": "Kompas",
+            "detik": "Detik",
+            "tempo": "Tempo",
+            "cnn indonesia": "CNN Indonesia",
+            "cnbc indonesia": "CNBC Indonesia",
+            "antara": "Antara",
+            "bisnis.com": "Bisnis",
+            "kontan": "Kontan",
+            "media indonesia": "Media Indonesia",
+            "metrotvnews": "MetroTV",
+            "kumparan": "Kumparan",
+            "tirto": "Tirto",
+            "republika": "Republika",
+            "liputan6": "Liputan6",
+            "jpnn": "JPNN",
+        }
+        high_risk_terms = [
+            "kpk", "korupsi", "suap", "gratifikasi", "tersangka", "dirjen",
+            "pencopotan", "dicopot", "diperiksa", "sidang", "dugaan",
+        ]
+
+        def _extract_domain(url_val):
+            try:
+                return urlsplit(url_val or "").netloc.lower().replace("www.", "") or ""
+            except Exception:
+                return ""
+
+        def _publisher_from_title(title, url_val="", source=""):
+            title = title or ""
+            parts = [p.strip() for p in re.split(r"\s+-\s+", title) if p.strip()]
+            if len(parts) > 1:
+                publisher = parts[-1]
+                publisher = re.sub(r"\s*\|\s*.*$", "", publisher).strip()
+                if 2 <= len(publisher) <= 45:
+                    return publisher
+            domain = _extract_domain(url_val)
+            if domain and domain != "news.google.com":
+                return domain
+            return source or domain or "Unknown"
+
+        def _article_topic(title, tags=""):
+            text = f"{title or ''} {tags or ''}".lower()
+            for label, keywords in watch_topics:
+                if any(keyword in text for keyword in keywords):
+                    return label
+            return "General BC"
+
+        def _article_score(title, sentiment="", source=""):
+            text = (title or "").lower()
+            score = 10
+            if sentiment == "Negatif":
+                score += 25
+            elif sentiment == "Positif":
+                score -= 4
+            score += min(35, sum(12 for term in high_risk_terms if term in text))
+            score += min(18, sum(5 for _, keywords in watch_topics for keyword in keywords if keyword in text))
+            if any(key in (source or "").lower() for key in major_sources):
+                score += 8
+            return max(0, min(100, score))
+
+        def _priority_label(score):
+            if score >= 65:
+                return "High"
+            if score >= 38:
+                return "Medium"
+            return "Low"
+
+        def _article_reason(title, sentiment="", topic=""):
+            text = (title or "").lower()
+            if any(term in text for term in ["kpk", "korupsi", "suap", "gratifikasi", "tersangka"]):
+                return "Reputational/legal risk signal"
+            if any(term in text for term in ["dirjen", "pencopotan", "dicopot", "presiden", "menkeu", "purbaya"]):
+                return "Leadership or policy attention"
+            if any(term in text for term in ["narkoba", "sabu", "kokain", "ganja"]):
+                return "High-impact enforcement case"
+            if any(term in text for term in ["rokok ilegal", "pita cukai", "cukai palsu"]):
+                return "Excise enforcement and revenue risk"
+            if sentiment == "Negatif":
+                return "Negative coverage trend"
+            return f"Watchlist topic: {topic}"
+
         daily_data = []
         for d in range(29, -1, -1):
             day = now_utc - timedelta(days=d)
@@ -2165,16 +2258,13 @@ def cmd_dashboard():
                 "Netral": counts.get("Netral", 0),
             })
 
-        cur.execute("SELECT url FROM seen WHERE first_seen_utc >= ? AND url != ''",
+        cur.execute("SELECT title, url, source FROM seen WHERE first_seen_utc >= ? AND url != ''",
                     ((now_utc - timedelta(days=30)).isoformat(),))
         domain_counter = Counter()
-        for (url_val,) in cur.fetchall():
-            try:
-                netloc = urlsplit(url_val).netloc.lower().replace("www.", "")
-                if netloc:
-                    domain_counter[netloc] += 1
-            except Exception:
-                pass
+        for title, url_val, source in cur.fetchall():
+            publisher = _publisher_from_title(title, url_val, source)
+            if publisher:
+                domain_counter[publisher] += 1
         source_data = [{"source": d, "count": c} for d, c in domain_counter.most_common(15) if d]
 
         week_cut = (now_utc - timedelta(days=7)).isoformat()
@@ -2202,14 +2292,11 @@ def cmd_dashboard():
                 row[tag] = day_tags.get(tag, 0)
             heatmap_data.append(row)
 
-        cur.execute("SELECT url, sentiment_label FROM seen WHERE first_seen_utc >= ? AND url != '' AND sentiment_label != ''",
+        cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label != ''",
                     (week_cut,))
         tone_sources = {}
-        for url_val, label in cur.fetchall():
-            try:
-                domain = urlsplit(url_val).netloc.lower().replace("www.", "")
-            except Exception:
-                continue
+        for title, url_val, source, label in cur.fetchall():
+            domain = _publisher_from_title(title, url_val, source)
             if not domain:
                 continue
             if domain not in tone_sources:
@@ -2273,16 +2360,10 @@ def cmd_dashboard():
                     (last_week_cut, week_cut))
         lw_sent = dict(cur.fetchall())
 
-        def _extract_domain(url_val):
-            try:
-                return urlsplit(url_val or "").netloc.lower().replace("www.", "") or ""
-            except Exception:
-                return ""
-
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Positif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
-        top_positive = [{"title": t, "url": u, "source": _extract_domain(u) or s} for t, u, s, _ in cur.fetchall()]
+        top_positive = [{"title": t, "url": u, "source": _publisher_from_title(t, u, s)} for t, u, s, _ in cur.fetchall()]
         cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Negatif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
-        top_negative = [{"title": t, "url": u, "source": _extract_domain(u) or s} for t, u, s, _ in cur.fetchall()]
+        top_negative = [{"title": t, "url": u, "source": _publisher_from_title(t, u, s)} for t, u, s, _ in cur.fetchall()]
 
         cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
                        FROM seen WHERE first_seen_utc >= ? AND title != ''
@@ -2294,15 +2375,139 @@ def cmd_dashboard():
                 time_str = dt.strftime("%d/%m %H:%M")
             except Exception:
                 time_str = ""
-            try:
-                display_src = urlsplit(url or "").netloc.lower().replace("www.", "") or source or ""
-            except Exception:
-                display_src = source or ""
+            display_src = _publisher_from_title(title, url, source)
             recent_articles.append({
                 "title": title or "", "url": url or "", "source": display_src,
                 "sentiment": sent or "Netral", "time": time_str,
                 "tags": (tags or "").split()[:3], "lang": lang or "id",
             })
+
+        cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
+                       FROM seen WHERE first_seen_utc >= ? AND title != ''
+                       ORDER BY first_seen_utc DESC""", (last_week_cut,))
+        article_rows = []
+        for title, url, source, sent, seen_utc, tags, lang in cur.fetchall():
+            try:
+                seen_dt = datetime.fromisoformat(seen_utc)
+            except Exception:
+                seen_dt = now_utc
+            publisher = _publisher_from_title(title, url, source)
+            topic = _article_topic(title, tags)
+            score = _article_score(title, sent or "Netral", publisher)
+            article_rows.append({
+                "title": title or "",
+                "url": url or "",
+                "source": publisher,
+                "sentiment": sent or "Netral",
+                "seen": seen_dt,
+                "time": seen_dt.astimezone(WIB).strftime("%d/%m %H:%M"),
+                "tags": (tags or "").split()[:3],
+                "lang": lang or "id",
+                "topic": topic,
+                "score": score,
+                "priority": _priority_label(score),
+                "reason": _article_reason(title, sent or "Netral", topic),
+            })
+
+        week_start_dt = now_utc - timedelta(days=7)
+        prev_week_start_dt = now_utc - timedelta(days=14)
+        week_articles = [a for a in article_rows if a["seen"] >= week_start_dt]
+        prev_week_articles = [a for a in article_rows if prev_week_start_dt <= a["seen"] < week_start_dt]
+        today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_articles = [a for a in week_articles if a["seen"] >= today_start]
+
+        watchlist_data = []
+        for label, keywords in watch_topics:
+            def matches(article):
+                text = f"{article['title']} {' '.join(article.get('tags', []))}".lower()
+                return any(keyword in text for keyword in keywords)
+            current_matches = [a for a in week_articles if matches(a)]
+            previous_matches = [a for a in prev_week_articles if matches(a)]
+            today_matches = [a for a in today_articles if matches(a)]
+            latest = current_matches[0] if current_matches else None
+            watchlist_data.append({
+                "topic": label,
+                "today": len(today_matches),
+                "week": len(current_matches),
+                "prev_week": len(previous_matches),
+                "delta": len(current_matches) - len(previous_matches),
+                "latest": latest["title"] if latest else "",
+                "url": latest["url"] if latest else "",
+            })
+        watchlist_data.sort(key=lambda x: (x["today"], x["week"], x["delta"]), reverse=True)
+
+        cluster_data = []
+        for label, _ in watch_topics:
+            current = [a for a in week_articles if a["topic"] == label]
+            previous = [a for a in prev_week_articles if a["topic"] == label]
+            if not current:
+                continue
+            sources = {a["source"] for a in current if a["source"]}
+            neg = sum(1 for a in current if a["sentiment"] == "Negatif")
+            cluster_data.append({
+                "topic": label,
+                "articles": len(current),
+                "sources": len(sources),
+                "negative": neg,
+                "trend": len(current) - len(previous),
+                "latest": current[0]["title"],
+                "url": current[0]["url"],
+                "tone": "negative" if neg / max(len(current), 1) >= 0.35 else "mixed",
+            })
+        cluster_data.sort(key=lambda x: (x["articles"] + max(x["trend"], 0), x["negative"]), reverse=True)
+        cluster_data = cluster_data[:8]
+
+        priority_articles = sorted(
+            [a for a in week_articles if a["score"] >= 38],
+            key=lambda a: (a["score"], a["seen"]),
+            reverse=True
+        )[:18]
+        priority_articles = [{
+            "priority": a["priority"], "score": a["score"], "topic": a["topic"],
+            "title": a["title"], "url": a["url"], "source": a["source"],
+            "sentiment": a["sentiment"], "time": a["time"], "reason": a["reason"],
+        } for a in priority_articles]
+
+        risk_daily = []
+        for d in range(29, -1, -1):
+            day = now_utc - timedelta(days=d)
+            start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
+            articles_for_day = [a for a in article_rows if start <= a["seen"] <= end]
+            neg = sum(1 for a in articles_for_day if a["sentiment"] == "Negatif")
+            high = sum(1 for a in articles_for_day if a["score"] >= 65)
+            score = min(100, round((neg * 3.5) + (high * 7) + (len(articles_for_day) * 0.08)))
+            risk_daily.append({"date": day.strftime("%d/%m"), "score": score, "negative": neg, "high": high})
+
+        major_media = []
+        for key, label in major_sources.items():
+            matched = [a for a in week_articles if key in a["source"].lower() or key in a["title"].lower()]
+            if not matched:
+                continue
+            major_media.append({
+                "source": label,
+                "articles": len(matched),
+                "negative": sum(1 for a in matched if a["sentiment"] == "Negatif"),
+                "latest": matched[0]["title"],
+            })
+        major_media.sort(key=lambda x: (x["articles"], x["negative"]), reverse=True)
+        major_media = major_media[:10]
+
+        high_count = sum(1 for a in week_articles if a["score"] >= 65)
+        major_negative = sum(item["negative"] for item in major_media)
+        neg_share = (wk_sent.get("Negatif", 0) / max(total_7d, 1)) * 100
+        rising_topics = sum(1 for c in cluster_data if c["trend"] > 0)
+        risk_score = min(100, round(neg_share * 1.2 + high_count * 3 + major_negative * 1.5 + rising_topics * 4))
+        risk_label = "High" if risk_score >= 70 else "Medium" if risk_score >= 40 else "Low"
+        top_cluster = cluster_data[0] if cluster_data else {}
+        situation = {
+            "risk_score": risk_score,
+            "risk_label": risk_label,
+            "top_issue": top_cluster.get("topic", top_10_tags[0] if top_10_tags else "No issue detected"),
+            "spike_topic": max(cluster_data, key=lambda c: c["trend"], default={}).get("topic", "No spike"),
+            "major_media_count": sum(item["articles"] for item in major_media),
+            "high_priority_count": high_count,
+        }
 
         cur.execute("""SELECT source_name, consecutive_fails, total_fetches, total_articles,
                               last_success_utc, last_fail_utc
@@ -2319,6 +2524,27 @@ def cmd_dashboard():
                 "last_success": last_success or "",
                 "last_fail": last_fail or "",
             })
+
+        data_quality = {
+            "sources_ok": sum(1 for s in source_health if s["status"] == "ok"),
+            "sources_warning": sum(1 for s in source_health if s["status"] != "ok"),
+            "recent_articles": len(recent_articles),
+            "tracked_30d": total_30d,
+            "last_seen": last_seen_wib,
+            "dashboard_generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
+        }
+
+        brief_lines = [
+            f"BC News Brief - {now_wib.strftime('%d %b %Y %H:%M WIB')}",
+            f"Risk: {risk_label} ({risk_score}/100)",
+            f"7d articles: {total_7d} | Negative: {wk_sent.get('Negatif', 0)} ({round(neg_share)}%)",
+            f"Top issue: {situation['top_issue']}",
+            f"Spike topic: {situation['spike_topic']}",
+            "Priority articles:",
+        ]
+        for item in priority_articles[:5]:
+            brief_lines.append(f"- [{item['priority']}] {item['title'][:110]}")
+        copy_brief = "\n".join(brief_lines)
 
         dashboard_json = json.dumps({
             "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
@@ -2347,6 +2573,14 @@ def cmd_dashboard():
             "top_negative": top_negative,
             "recent": recent_articles,
             "source_health": source_health,
+            "situation": situation,
+            "risk_daily": risk_daily,
+            "watchlist": watchlist_data,
+            "clusters": cluster_data,
+            "priority_articles": priority_articles,
+            "major_media": major_media,
+            "data_quality": data_quality,
+            "copy_brief": copy_brief,
         }, ensure_ascii=False)
 
         html_content = _build_dashboard_html(dashboard_json)
@@ -2463,9 +2697,38 @@ def _build_dashboard_html(data_json: str) -> str:
   .status-pill {{ border-radius: 999px; padding: 3px 8px; font-size: 0.68rem; font-weight: 700; }}
   .status-ok {{ background: rgba(34,197,94,0.14); color: #86efac; }}
   .status-warning {{ background: rgba(251,191,36,0.14); color: #fde68a; }}
+  .risk-card {{ background: linear-gradient(135deg, rgba(248,113,113,0.16), rgba(30,41,59,1)); }}
+  .risk-score {{ font-size: 3rem; font-weight: 900; line-height: 1; }}
+  .risk-label {{ display: inline-flex; margin-top: 8px; border-radius: 999px; padding: 4px 10px;
+                 background: rgba(248,113,113,0.14); color: #fecaca; font-size: 0.72rem; font-weight: 800; }}
+  .metric-note {{ color: #94a3b8; font-size: 0.75rem; margin-top: 8px; line-height: 1.4; }}
+  .list-table {{ width: 100%; border-collapse: collapse; font-size: 0.78rem; }}
+  .list-table th {{ color: #64748b; text-align: left; font-size: 0.68rem; text-transform: uppercase;
+                    letter-spacing: 0.5px; border-bottom: 1px solid #1e3a5f; padding: 8px 6px; }}
+  .list-table td {{ border-bottom: 1px solid #1e3a5f; padding: 9px 6px; vertical-align: top; }}
+  .list-table tr:last-child td {{ border-bottom: none; }}
+  .list-table a {{ color: #bfdbfe; text-decoration: none; }}
+  .list-table a:hover {{ color: #93c5fd; text-decoration: underline; }}
+  .pill {{ display: inline-flex; border-radius: 999px; padding: 2px 8px; font-size: 0.68rem; font-weight: 800; }}
+  .pill-high {{ background: rgba(248,113,113,0.16); color: #fecaca; }}
+  .pill-medium {{ background: rgba(251,191,36,0.16); color: #fde68a; }}
+  .pill-low {{ background: rgba(96,165,250,0.14); color: #bfdbfe; }}
+  .cluster-list, .watch-list, .media-list {{ display: grid; gap: 10px; }}
+  .cluster-item, .watch-item, .media-item {{ padding: 10px 0; border-bottom: 1px solid #1e3a5f; }}
+  .cluster-item:last-child, .watch-item:last-child, .media-item:last-child {{ border-bottom: none; }}
+  .item-top {{ display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }}
+  .item-title {{ font-weight: 800; color: #e2e8f0; }}
+  .item-meta {{ color: #94a3b8; font-size: 0.72rem; margin-top: 4px; line-height: 1.35; }}
+  .brief-box {{ width: 100%; min-height: 160px; resize: vertical; background: #0f172a; color: #dbeafe;
+                border: 1px solid #1e3a5f; border-radius: 12px; padding: 12px; font: inherit;
+                font-size: 0.8rem; line-height: 1.45; }}
+  .copy-btn {{ margin-top: 10px; background: #2563eb; color: #fff; border: 0; border-radius: 10px;
+               padding: 8px 12px; font: inherit; font-size: 0.78rem; font-weight: 800; cursor: pointer; }}
+  .copy-btn:hover {{ background: #1d4ed8; }}
   @media (max-width: 700px) {{
     .stat .num {{ font-size: 1.5rem; }}
     .grid {{ grid-template-columns: 1fr; }}
+    .list-table {{ font-size: 0.72rem; }}
   }}
 </style>
 </head>
@@ -2476,6 +2739,27 @@ def _build_dashboard_html(data_json: str) -> str:
     <div><h1>BC News Monitor</h1></div>
   </div>
   <div class="subtitle" id="generated"></div>
+
+  <div class="grid-3">
+    <div class="card risk-card">
+      <h2>Situation Risk</h2>
+      <div class="risk-score" id="riskScore">-</div>
+      <div class="risk-label" id="riskLabel">Loading</div>
+      <div class="metric-note" id="riskNote"></div>
+    </div>
+    <div class="card">
+      <h2>Top Issue</h2>
+      <div class="stat"><div class="num" style="font-size:1.45rem;color:#fbbf24" id="topIssue">-</div></div>
+      <div class="metric-note" id="spikeTopic"></div>
+    </div>
+    <div class="card">
+      <h2>Priority Signals</h2>
+      <div class="stat-row">
+        <div class="stat"><div class="num neg" id="highPriorityCount">-</div><div class="label">High priority</div></div>
+        <div class="stat"><div class="num" style="color:#93c5fd" id="majorMediaCount">-</div><div class="label">Major-media hits</div></div>
+      </div>
+    </div>
+  </div>
 
   <div class="grid-3">
     <div class="card">
@@ -2512,9 +2796,16 @@ def _build_dashboard_html(data_json: str) -> str:
 
   <div class="grid">
     <div class="card">
+      <h2>Risk Timeline (30 hari)</h2>
+      <canvas id="riskChart"></canvas>
+    </div>
+    <div class="card">
       <h2>📈 Sentimen Harian (30 hari)</h2>
       <canvas id="sentimentChart"></canvas>
     </div>
+  </div>
+
+  <div class="grid">
     <div class="card">
       <h2>🌍 Bahasa (30 hari)</h2>
       <canvas id="langChart"></canvas>
@@ -2538,8 +2829,41 @@ def _build_dashboard_html(data_json: str) -> str:
       <div class="insight-list" id="insightContainer"></div>
     </div>
     <div class="card">
-      <h2>Source Health</h2>
+      <h2>Data Quality / Source Health</h2>
       <div class="status-list" id="sourceHealthContainer"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Story Clusters</h2>
+      <div class="cluster-list" id="clusterContainer"></div>
+    </div>
+    <div class="card">
+      <h2>Watchlist</h2>
+      <div class="watch-list" id="watchlistContainer"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>Priority Articles</h2>
+    <div style="overflow-x:auto">
+      <table class="list-table">
+        <thead><tr><th>Priority</th><th>Topic</th><th>Article</th><th>Source</th><th>Why</th></tr></thead>
+        <tbody id="priorityTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Major Media</h2>
+      <div class="media-list" id="majorMediaContainer"></div>
+    </div>
+    <div class="card">
+      <h2>Copy Brief</h2>
+      <textarea class="brief-box" id="briefBox" readonly></textarea>
+      <button class="copy-btn" id="copyBriefBtn" type="button">Copy brief</button>
     </div>
   </div>
 
@@ -2600,6 +2924,91 @@ const safeUrl = (value) => {{
   }}
 }};
 const empty = (text) => '<div style="color:#334155;padding:12px">' + esc(text) + '</div>';
+const priorityClass = (priority) => 'pill-' + String(priority || 'Low').toLowerCase();
+
+function deriveDashboardData() {{
+  const recent = D.recent || [];
+  const negShare = Math.round((Number(D.summary.negatif_7d || 0) / Math.max(Number(D.summary.total_7d || 0), 1)) * 100);
+  const fallbackRisk = Math.min(100, Math.round(negShare * 1.4 + ((D.top_negative || []).length * 6)));
+  D.situation = D.situation || {{
+    risk_score: fallbackRisk,
+    risk_label: fallbackRisk >= 70 ? 'High' : fallbackRisk >= 40 ? 'Medium' : 'Low',
+    top_issue: (D.heatmap_tags || [])[0] || 'No issue detected',
+    spike_topic: (D.heatmap_tags || [])[1] || 'No spike',
+    major_media_count: (D.major_media || []).reduce((sum, item) => sum + Number(item.articles || 0), 0),
+    high_priority_count: (D.priority_articles || []).filter(a => a.priority === 'High').length,
+  }};
+  D.risk_daily = D.risk_daily || (D.daily_sentiment || []).map(row => ({{
+    date: row.date,
+    score: Math.min(100, Math.round(Number(row.Negatif || 0) * 4 + Number(row.Netral || 0) * 0.2)),
+    negative: Number(row.Negatif || 0),
+    high: 0,
+  }}));
+  const latestHeatmap = (D.heatmap || [])[Math.max((D.heatmap || []).length - 1, 0)] || {{}};
+  D.clusters = D.clusters || (D.heatmap_tags || []).slice(0, 6).map(tag => ({{
+    topic: tag,
+    articles: (D.heatmap || []).reduce((sum, row) => sum + Number(row[tag] || 0), 0),
+    sources: 0,
+    negative: 0,
+    trend: 0,
+    latest: '',
+    url: '',
+    tone: 'mixed',
+  }})).filter(item => item.articles > 0);
+  D.watchlist = D.watchlist || D.clusters.map(item => ({{
+    topic: item.topic,
+    today: Number(latestHeatmap[item.topic] || 0),
+    week: item.articles,
+    prev_week: 0,
+    delta: item.trend,
+    latest: item.latest,
+    url: item.url,
+  }}));
+  D.priority_articles = D.priority_articles || [...(D.top_negative || []), ...recent.filter(a => a.sentiment === 'Negatif')].slice(0, 12).map(a => ({{
+    priority: 'Medium',
+    score: 45,
+    topic: (a.tags || [])[0] || 'Negative Coverage',
+    title: a.title || '',
+    url: a.url || '',
+    source: a.source || '',
+    sentiment: a.sentiment || 'Negatif',
+    time: a.time || '',
+    reason: 'Negative or watchlist coverage',
+  }}));
+  D.situation.high_priority_count = D.situation.high_priority_count || D.priority_articles.filter(a => a.priority === 'High').length;
+  D.situation.major_media_count = D.situation.major_media_count || (D.major_media || []).reduce((sum, item) => sum + Number(item.articles || 0), 0);
+  if (!D.major_media) {{
+    const majorNames = ['Kompas', 'Detik', 'Tempo', 'CNN Indonesia', 'CNBC Indonesia', 'Antara', 'Bisnis', 'Kontan', 'MetroTV', 'JPNN'];
+    D.major_media = majorNames.map(name => {{
+      const hits = recent.filter(a => [a.title, a.source].join(' ').toLowerCase().includes(name.toLowerCase()));
+      return {{
+        source: name,
+        articles: hits.length,
+        negative: hits.filter(a => a.sentiment === 'Negatif').length,
+        latest: hits[0]?.title || '',
+      }};
+    }}).filter(item => item.articles > 0);
+  }}
+  D.situation.major_media_count = D.situation.major_media_count || D.major_media.reduce((sum, item) => sum + Number(item.articles || 0), 0);
+  D.data_quality = D.data_quality || {{
+    sources_ok: (D.source_health || []).filter(s => s.status === 'ok').length,
+    sources_warning: (D.source_health || []).filter(s => s.status !== 'ok').length,
+    recent_articles: recent.length,
+    tracked_30d: D.summary.total_30d || 0,
+    last_seen: D.summary.last_seen || '',
+    dashboard_generated: D.generated || '',
+  }};
+  D.copy_brief = D.copy_brief || [
+    'BC News Brief - ' + (D.generated || ''),
+    'Risk: ' + D.situation.risk_label + ' (' + D.situation.risk_score + '/100)',
+    '7d articles: ' + (D.summary.total_7d || 0) + ' | Negative: ' + (D.summary.negatif_7d || 0) + ' (' + negShare + '%)',
+    'Top issue: ' + D.situation.top_issue,
+    'Spike topic: ' + D.situation.spike_topic,
+    'Priority articles:',
+    ...D.priority_articles.slice(0, 5).map(a => '- [' + a.priority + '] ' + String(a.title || '').slice(0, 110)),
+  ].join('\\n');
+}}
+deriveDashboardData();
 
 function wowArrow(curr, prev) {{
   if (prev === 0) return '<span class="flat">— baru</span>';
@@ -2621,10 +3030,36 @@ byId('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
 byId('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
 byId('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
 byId('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
+byId('riskScore').textContent = D.situation.risk_score;
+byId('riskLabel').textContent = D.situation.risk_label + ' attention';
+byId('riskNote').textContent = 'Negative share, high-priority items, major-media coverage, and rising clusters.';
+byId('topIssue').textContent = D.situation.top_issue;
+byId('spikeTopic').textContent = 'Spike topic: ' + D.situation.spike_topic;
+byId('highPriorityCount').textContent = D.situation.high_priority_count;
+byId('majorMediaCount').textContent = D.situation.major_media_count;
 
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = '#1e3a5f';
 Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif';
+
+new Chart(document.getElementById('riskChart'), {{
+  type: 'line',
+  data: {{
+    labels: D.risk_daily.map(d => d.date),
+    datasets: [
+      {{ label: 'Risk score', data: D.risk_daily.map(d => d.score),
+         borderColor: '#fb7185', backgroundColor: 'rgba(251,113,133,0.12)', fill: true,
+         tension: 0.35, borderWidth: 2, pointRadius: 0 }},
+      {{ label: 'High priority', data: D.risk_daily.map(d => d.high),
+         borderColor: '#fbbf24', backgroundColor: 'rgba(251,191,36,0.08)', fill: false,
+         tension: 0.3, borderWidth: 1.5, pointRadius: 0 }},
+    ]
+  }},
+  options: {{ responsive: true, interaction: {{ intersect: false, mode: 'index' }},
+    plugins: {{ legend: {{ position: 'bottom', labels: {{ usePointStyle: true, padding: 16 }} }} }},
+    scales: {{ x: {{ ticks: {{ maxTicksLimit: 8, font: {{ size: 10 }} }} }},
+               y: {{ beginAtZero: true, suggestedMax: 100 }} }} }}
+}});
 
 new Chart(document.getElementById('sentimentChart'), {{
   type: 'line',
@@ -2735,6 +3170,72 @@ if (D.source_health && D.source_health.length) {{
 }} else {{
   healthEl.innerHTML = empty('Source health will appear after the monitor runs.');
 }}
+if (D.data_quality) {{
+  healthEl.innerHTML += '<div class="status-row">' +
+    '<div><strong>Dashboard data</strong><div class="src">' +
+    esc(D.data_quality.recent_articles || 0) + ' recent shown, ' + esc(D.data_quality.tracked_30d || 0) + ' tracked in 30d</div></div>' +
+    '<span class="status-pill status-ok">indexed</span></div>';
+}}
+
+const clusterEl = byId('clusterContainer');
+if (D.clusters && D.clusters.length) {{
+  clusterEl.innerHTML = D.clusters.map(c => '<div class="cluster-item">' +
+    '<div class="item-top"><span class="item-title">' + esc(c.topic) + '</span><span class="pill ' + (c.tone === 'negative' ? 'pill-high' : 'pill-medium') + '">' +
+    esc(c.articles) + ' articles</span></div>' +
+    '<div class="item-meta">' + esc(c.sources || 0) + ' sources | ' + esc(c.negative || 0) + ' negative | trend ' +
+    (Number(c.trend || 0) >= 0 ? '+' : '') + esc(c.trend || 0) + '</div>' +
+    (c.latest ? '<div class="item-meta"><a href="' + safeUrl(c.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(c.latest).slice(0, 120)) + '</a></div>' : '') +
+  '</div>').join('');
+}} else {{
+  clusterEl.innerHTML = empty('No active clusters yet.');
+}}
+
+const watchEl = byId('watchlistContainer');
+if (D.watchlist && D.watchlist.length) {{
+  watchEl.innerHTML = D.watchlist.slice(0, 9).map(w => '<div class="watch-item">' +
+    '<div class="item-top"><span class="item-title">' + esc(w.topic) + '</span><span class="pill pill-low">' +
+    esc(w.today || 0) + ' today</span></div>' +
+    '<div class="item-meta">' + esc(w.week || 0) + ' this week | ' + (Number(w.delta || 0) >= 0 ? '+' : '') + esc(w.delta || 0) + ' vs previous week</div>' +
+    (w.latest ? '<div class="item-meta"><a href="' + safeUrl(w.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(w.latest).slice(0, 120)) + '</a></div>' : '') +
+  '</div>').join('');
+}} else {{
+  watchEl.innerHTML = empty('No watchlist hits yet.');
+}}
+
+const priorityEl = byId('priorityTable');
+if (D.priority_articles && D.priority_articles.length) {{
+  priorityEl.innerHTML = D.priority_articles.map(a => '<tr>' +
+    '<td><span class="pill ' + priorityClass(a.priority) + '">' + esc(a.priority) + '</span><div class="item-meta">' + esc(a.score || 0) + '/100</div></td>' +
+    '<td>' + esc(a.topic || '-') + '<div class="item-meta">' + esc(a.time || '') + '</div></td>' +
+    '<td><a href="' + safeUrl(a.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(a.title || '').slice(0, 140)) + '</a></td>' +
+    '<td>' + esc(a.source || '-') + '<div class="item-meta">' + esc(a.sentiment || '') + '</div></td>' +
+    '<td>' + esc(a.reason || '') + '</td>' +
+  '</tr>').join('');
+}} else {{
+  priorityEl.innerHTML = '<tr><td colspan="5" style="color:#334155;padding:12px">No priority articles yet.</td></tr>';
+}}
+
+const mediaEl = byId('majorMediaContainer');
+if (D.major_media && D.major_media.length) {{
+  mediaEl.innerHTML = D.major_media.map(m => '<div class="media-item">' +
+    '<div class="item-top"><span class="item-title">' + esc(m.source) + '</span><span class="pill pill-low">' + esc(m.articles || 0) + ' articles</span></div>' +
+    '<div class="item-meta">' + esc(m.negative || 0) + ' negative mentions</div>' +
+    (m.latest ? '<div class="item-meta">' + esc(String(m.latest).slice(0, 120)) + '</div>' : '') +
+  '</div>').join('');
+}} else {{
+  mediaEl.innerHTML = empty('No major-media hits in this window.');
+}}
+
+byId('briefBox').value = D.copy_brief || '';
+byId('copyBriefBtn').addEventListener('click', async () => {{
+  try {{
+    await navigator.clipboard.writeText(byId('briefBox').value);
+    byId('copyBriefBtn').textContent = 'Copied';
+  }} catch {{
+    byId('briefBox').select();
+    byId('copyBriefBtn').textContent = 'Select text to copy';
+  }}
+}});
 
 function renderArticles(containerId, articles, dotColor) {{
   const el = document.getElementById(containerId);
