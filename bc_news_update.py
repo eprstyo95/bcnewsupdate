@@ -157,6 +157,10 @@ def is_relevant(title: str, description: str = "") -> bool:
 MAX_ITEMS_PER_BATCH = 1
 SEND_HEARTBEAT = True
 
+# When the heartbeat is sent: "always" every run (288 a day at the 5-minute
+# schedule), "news" only on runs that found something, "never" to switch it off.
+HEARTBEAT_WHEN = os.environ.get("HEARTBEAT_WHEN", "always").strip().lower()
+
 INCLUDE_SNIPPET = True
 SNIPPET_MAX_CHARS = 150
 
@@ -183,6 +187,40 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_PRIVATE_CHAT_ID = os.environ.get("TELEGRAM_PRIVATE_CHAT_ID", "")
 
 TELEGRAM_ALERT_CHATS = list({c for c in [TELEGRAM_CHAT_ID, TELEGRAM_PRIVATE_CHAT_ID] if c})
+
+# Two audiences, because the group is there to read the news and nothing else.
+#   AUDIENCE_NEWS → TELEGRAM_CHAT_ID, the group. Article posts only.
+#   AUDIENCE_OPS  → TELEGRAM_PRIVATE_CHAT_ID, the owner's direct chat. Heartbeat,
+#                   trending and sentiment alerts, source-health warnings, run
+#                   failures, digests, stats and reports.
+# Ops is the default for telegram_send, so anything added later stays out of the
+# group until it explicitly asks to be in it.
+AUDIENCE_NEWS = "news"
+AUDIENCE_OPS = "ops"
+
+# Articles go to the group only. Set to 1 to also receive every article in the
+# private chat, the way it worked before the group existed.
+NEWS_ALSO_PRIVATE = os.environ.get("NEWS_ALSO_PRIVATE", "0").strip() in {"1", "true", "yes"}
+
+
+def audience_chat_ids(audience):
+    """Chat ids for an audience, falling back to the other chat if unset.
+
+    Falling back matters for ops: a run failure that cannot reach the private
+    chat is better announced in the group than swallowed.
+    """
+    if audience == AUDIENCE_NEWS:
+        targets = [TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else []
+        if NEWS_ALSO_PRIVATE and TELEGRAM_PRIVATE_CHAT_ID:
+            targets.append(TELEGRAM_PRIVATE_CHAT_ID)
+        return targets or ([TELEGRAM_PRIVATE_CHAT_ID] if TELEGRAM_PRIVATE_CHAT_ID else [])
+
+    if TELEGRAM_PRIVATE_CHAT_ID:
+        return [TELEGRAM_PRIVATE_CHAT_ID]
+    if TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_PRIVATE_CHAT_ID not set — status messages will go to the group")
+        return [TELEGRAM_CHAT_ID]
+    return []
 
 _allowed_raw = os.environ.get("TELEGRAM_ALLOWED_CHATS", "")
 TELEGRAM_ALLOWED_CHATS = {c.strip() for c in _allowed_raw.split(",") if c.strip()}
@@ -682,20 +720,21 @@ def _telegram_send_one(session, chat_id, text, reply_markup=None):
     print(f"Telegram [{chat_id}]:", r.status_code, (r.text or "")[:120])
 
 
-def telegram_send(session, text, reply_markup=None):
+def telegram_send(session, text, reply_markup=None, audience=AUDIENCE_OPS):
     if not TELEGRAM_BOT_TOKEN:
         print("⚠️ Telegram skipped: no bot token")
         return
     if _reply_target_chat_id:
+        # Answering a command someone typed: reply where they asked.
         _telegram_send_one(session, _reply_target_chat_id, text, reply_markup)
-    else:
-        targets = TELEGRAM_ALERT_CHATS or ([TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else [])
-        for cid in targets:
-            _telegram_send_one(session, cid, text, reply_markup)
+        return
+    for cid in audience_chat_ids(audience):
+        _telegram_send_one(session, cid, text, reply_markup)
 
 
 def telegram_send_document(session, filepath, caption="", chat_id=None):
-    target = chat_id or _reply_target_chat_id or TELEGRAM_CHAT_ID
+    ops_targets = audience_chat_ids(AUDIENCE_OPS)
+    target = chat_id or _reply_target_chat_id or (ops_targets[0] if ops_targets else "")
     if not TELEGRAM_BOT_TOKEN or not target:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -926,7 +965,7 @@ def _send_single_article(session, it):
 
     reply_markup = {"inline_keyboard": keyboard} if keyboard else None
     for part in chunk_text(text):
-        telegram_send(session, part, reply_markup=reply_markup)
+        telegram_send(session, part, reply_markup=reply_markup, audience=AUDIENCE_NEWS)
 
 
 # =========================
@@ -1100,7 +1139,12 @@ def cmd_run():
         for alert in check_source_health_alerts(con):
             telegram_send(session, alert)
 
-        if SEND_HEARTBEAT:
+        heartbeat_due = (
+            SEND_HEARTBEAT
+            and HEARTBEAT_WHEN != "never"
+            and (HEARTBEAT_WHEN != "news" or new_items)
+        )
+        if heartbeat_due:
             sent_summary = " | ".join(
                 f"{emoji} {label}: {sent_counts.get(label, 0)}"
                 for label, emoji in [("Positif", "🟢"), ("Negatif", "🔴"), ("Netral", "⚪")])
@@ -1776,6 +1820,7 @@ TELEGRAM_COMMANDS = {
     "/report": "Buat & kirim laporan PDF mingguan",
     "/health": "Cek status sumber berita",
     "/backfill": "Isi ulang data lama (source/sentimen)",
+    "/chatid": "Tampilkan chat ID (untuk setting secret)",
 }
 
 
@@ -1978,6 +2023,16 @@ def handle_bot_command(session, command, chat_id, con):
                 lines.append(f"  {c} — {desc}")
             lines.append("\n💡 Bot checks commands every 5 min.")
             telegram_send(session, "\n".join(lines))
+        elif cmd == "/chatid":
+            # Run it in the group to read off the id that belongs in
+            # TELEGRAM_CHAT_ID, and in the private chat for
+            # TELEGRAM_PRIVATE_CHAT_ID.
+            kind = "grup" if str(chat_id).startswith("-") else "pribadi"
+            role = "TELEGRAM_CHAT_ID (berita)" if kind == "grup" else "TELEGRAM_PRIVATE_CHAT_ID (status)"
+            telegram_send(session,
+                          f"🆔 Chat ID: <code>{html.escape(str(chat_id))}</code>\n"
+                          f"Tipe: {kind}\n"
+                          f"Simpan sebagai secret: <b>{role}</b>")
         elif cmd == "/stats":
             cmd_stats()
         elif cmd == "/digest":
@@ -2118,6 +2173,7 @@ def cmd_setup():
         {"command": "report", "description": "Laporan PDF mingguan"},
         {"command": "health", "description": "Status sumber berita"},
         {"command": "backfill", "description": "Isi ulang data lama"},
+        {"command": "chatid", "description": "Tampilkan chat ID"},
     ]
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
     for scope in [None, {"type": "all_group_chats"}]:
