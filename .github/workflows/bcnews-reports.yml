@@ -18,6 +18,8 @@ on:
           - report
           - export
           - all
+permissions:
+  contents: read
 concurrency:
   group: bcnews-reports-${{ github.ref_name }}
   cancel-in-progress: false
@@ -26,10 +28,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # The DB comes from the checkout, not from actions/cache: a prefix-matched
+      # cache entry is an older snapshot, and reporting off it silently drops the
+      # newest articles from the digest, stats and weekly PDF.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -37,16 +42,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Restore seen database cache
-        uses: actions/cache/restore@v4
-        with:
-          path: seen.sqlite
-          key: seen-db-v2-${{ runner.os }}-${{ github.ref_name }}
-          restore-keys: |
-            seen-db-v2-${{ runner.os }}-${{ github.ref_name }}-
-            seen-db-v2-${{ runner.os }}-
-            seen-db-v2-
 
       # ── Daily digest (9 PM WIB) ──
       - name: Run daily digest
@@ -107,7 +102,7 @@ jobs:
         if: >-
           (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1')
           || (github.event_name == 'workflow_dispatch' && (inputs.command == 'export' || inputs.command == 'report' || inputs.command == 'all'))
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bc-weekly-${{ github.run_id }}
           path: |
