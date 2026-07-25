@@ -196,9 +196,45 @@ MARUNDA_COMPANIES = [
 
 # Google News rejects an over-long query, so the companies are swept a slice at
 # a time, the cursor surviving in bot_state. At MARUNDA_QUERY_BATCH=12 a full
-# sweep takes 11 runs, and every company is checked several times inside the
-# 24-hour window the query asks for.
+# sweep takes 11 runs. The query asks for a week and MARUNDA_MAX_AGE_HOURS does
+# the trimming, because Google indexes this kind of reporting late and a strike
+# that started yesterday is still news.
 MARUNDA_QUERY_BATCH = 12
+
+# Every company on that list runs a kawasan berikat, PLB or gudang berikat, so
+# the news that matters is the news that threatens the facility: a bankruptcy,
+# a shutdown, mass layoffs or a strike all put the goods and the outstanding
+# duties inside it at issue. Ordinary corporate news about the same company —
+# a new director, a sponsorship — is not what this watch is for.
+#
+# The gate is applied here rather than inside the Google query: asking Google for
+# twelve names AND a distress clause returns nothing at all, while the same
+# twelve names alone return results normally, so Google matches the names and
+# this list decides what counts.
+MARUNDA_DISTRESS_TERMS = [
+    # Insolvency
+    "pailit", "kepailitan", "pkpu", "bangkrut", "kebangkrutan",
+    "likuidasi", "gulung tikar", "penundaan kewajiban pembayaran utang",
+    # Closure / relocation
+    "tutup pabrik", "pabrik tutup", "penutupan pabrik", "tutup permanen",
+    "setop produksi", "stop produksi", "hentikan produksi", "relokasi pabrik",
+    "pindah pabrik", "efisiensi pabrik",
+    # Layoffs
+    "phk", "pemutusan hubungan kerja", "layoff", "lay off", "lay-off",
+    "dirumahkan", "rumahkan karyawan", "pengurangan karyawan",
+    "pekerja dipecat", "karyawan dipecat", "pesangon",
+    # Labour unrest
+    "demo", "demonstrasi", "unjuk rasa", "mogok kerja", "mogok nasional",
+    "aksi buruh", "buruh protes", "protes karyawan", "sengketa perburuhan",
+    "tuntut upah", "tunggakan upah", "upah tidak dibayar", "gaji tidak dibayar",
+    "serikat pekerja", "serikat buruh",
+]
+
+# Company news is rarer than customs news and Google indexes it later, so these
+# items get a longer window than MAX_AGE_HOURS before they count as stale.
+MARUNDA_MAX_AGE_HOURS = 72
+MARUNDA_RESULT_LIMIT = 100
+MARUNDA_SOURCE = "GoogleNews-Marunda"
 
 # Short names without "Indonesia" in them read as ordinary phrases: "Sarinah" is
 # a Jakarta landmark and "Dragon Forever" is a Jackie Chan film, both of which
@@ -317,13 +353,36 @@ def match_marunda_company(title: str, description: str = ""):
     return None
 
 
+def match_marunda_distress(title: str, description: str = ""):
+    """Return the distress term a text carries, or None."""
+    text = f"{title} {description}".lower()
+    for term in MARUNDA_DISTRESS_TERMS:
+        if re.search(rf"\b{re.escape(term)}\b", text):
+            return term
+    return None
+
+
+def marunda_alert(title: str, description: str = ""):
+    """Return (company, distress_term) when a jurisdiction facility is at issue.
+
+    Both halves are required. The company alone brings in director appointments
+    and sponsorships; the distress term alone brings in every layoff in the
+    country.
+    """
+    company = match_marunda_company(title, description)
+    if not company:
+        return None, None
+    return company, match_marunda_distress(title, description)
+
+
 def is_relevant(title: str, description: str = "") -> bool:
     """
     Two-layer relevance check for ALL fetched items.
 
     Layer 1 — must match at least one RELEVANCE_REQUIRED_KEYWORDS, or name a
-              company in this office's jurisdiction. A company article often
-              never says "cukai", which is exactly why it needs its own way in.
+              jurisdiction company *and* a distress event. A pailit or PHK story
+              never says "cukai", which is why it needs its own way in, but the
+              company on its own is not news for this watch.
     Layer 2 — reject if blocklist terms dominate over relevant hits
               (catches articles that mention bea cukai once in a
                budget table but are really about APBN/OJK/etc.).
@@ -331,10 +390,11 @@ def is_relevant(title: str, description: str = "") -> bool:
     text = f"{title} {description}".lower()
 
     relevant_hits = sum(1 for kw in RELEVANCE_REQUIRED_KEYWORDS if kw in text)
-    if match_marunda_company(title, description):
-        # A named company is a strong signal on its own, so it counts as two
-        # hits and survives the blocklist check below — company news legitimately
-        # mentions saham or pajak without being about either.
+    company, distress = marunda_alert(title, description)
+    if company and distress:
+        # A facility in distress is the strongest signal this monitor has, so it
+        # counts as two hits and survives the blocklist below — such reporting
+        # legitimately mentions saham or pajak without being about either.
         relevant_hits += 2
     if relevant_hits == 0:
         return False
@@ -1051,10 +1111,25 @@ def make_hashtags(title: str, url: str = ""):
         (["sanctions", "embargo"], "#Sanctions"),
     ]
     out = []
-    # A jurisdiction company leads the tags — it is the reason the article was
+    # A facility in distress leads the tags — it is the reason the article was
     # kept, so it should survive the five-tag cut.
-    if match_marunda_company(title):
+    company, distress = marunda_alert(title)
+    if company:
         out.append("#PerusahaanMarunda")
+    if distress:
+        for terms, tag in [
+            (("pailit", "kepailitan", "pkpu", "bangkrut", "kebangkrutan",
+              "likuidasi", "gulung tikar", "penundaan kewajiban"), "#Pailit"),
+            (("phk", "pemutusan hubungan kerja", "layoff", "lay off", "lay-off",
+              "dirumahkan", "pesangon", "dipecat", "pengurangan karyawan"), "#PHK"),
+            (("mogok", "demo", "demonstrasi", "unjuk rasa", "aksi buruh",
+              "protes", "serikat", "upah", "gaji tidak dibayar"), "#AksiBuruh"),
+            (("tutup", "setop produksi", "stop produksi", "hentikan produksi",
+              "relokasi", "pindah pabrik", "efisiensi pabrik"), "#TutupPabrik"),
+        ]:
+            if any(term in distress for term in terms):
+                out.append(tag)
+                break
     for keys, tag in TAGS:
         if any(k in t or k in u for k in keys):
             out.append(tag)
@@ -1310,9 +1385,12 @@ def _send_single_article(session, it):
     lines.append(f"🕒 {fmt_wib(pub)}")
     lines.append(f"📌 {src_h} {lang_flag}")
 
-    company = match_marunda_company(title, description)
+    company, distress = marunda_alert(title, description)
     if company:
         lines.append(f"🏭 <b>Perusahaan fasilitas Marunda:</b> {html.escape(company)}")
+        if distress:
+            lines.append(f"🚨 <b>Indikasi:</b> {html.escape(distress.upper())} "
+                         f"— fasilitas berikat, cek status &amp; jaminan")
     lines.append(f"{sent_emoji} Sentimen: <b>{sent_label}</b>")
     lines.append(f"🏷️ {tags_h}")
 
@@ -1368,11 +1446,11 @@ def next_marunda_query(con):
     set_bot_state(con, "marunda_query_cursor",
                   str((cursor + len(slice_)) % len(MARUNDA_COMPANIES)))
 
-    query = " OR ".join(f'"{name}"' for name in slice_) + " when:24h"
+    query = " OR ".join(f'"{name}"' for name in slice_) + " when:7d"
     return query, slice_
 
 
-def fetch_google_news_rss(session, query, language="id"):
+def fetch_google_news_rss(session, query, language="id", limit=None):
     if language == "id":
         rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=id&gl=ID&ceid=ID:id"
     else:
@@ -1380,7 +1458,7 @@ def fetch_google_news_rss(session, query, language="id"):
 
     feed = parse_feed(session, rss_url)
     out = []
-    for entry in feed.entries[:GOOGLE_RSS_SIZE]:
+    for entry in feed.entries[:(limit or GOOGLE_RSS_SIZE)]:
         pub = entry_published_utc(entry)
         out.append({
             "source": f"GoogleNews-{language.upper()}",
@@ -1401,8 +1479,9 @@ def _matches_direct_keywords(title: str, description: str = "") -> bool:
     text = f"{title} {description}".lower()
     if any(kw in text for kw in DIRECT_RSS_KEYWORDS):
         return True
-    # The general-interest feeds carry company news that never says "cukai".
-    return match_marunda_company(title, description) is not None
+    # The general-interest feeds carry facility distress that never says "cukai".
+    company, distress = marunda_alert(title, description)
+    return bool(company and distress)
 
 
 def fetch_direct_rss(session):
@@ -1478,7 +1557,10 @@ def cmd_run():
         rss_marunda = []
         if marunda_query:
             try:
-                rss_marunda = fetch_google_news_rss(session, marunda_query, language="id")
+                # A widely-covered company can fill a slice on its own, so this
+                # query reads deeper than the customs queries do.
+                rss_marunda = fetch_google_news_rss(session, marunda_query,
+                                                    language="id", limit=MARUNDA_RESULT_LIMIT)
                 for item in rss_marunda:
                     item["source"] = "GoogleNews-Marunda"
                 record_source_health(con, "GoogleNews-Marunda", len(rss_marunda))
@@ -1530,12 +1612,17 @@ def cmd_run():
         sent_counts = {"Positif": 0, "Negatif": 0, "Netral": 0}
         lang_counts = {"id": 0, "en": 0}
 
+        marunda_cutoff = now_utc - timedelta(hours=MARUNDA_MAX_AGE_HOURS)
+
         for it in items:
             pub = it.get("published_utc")
             if pub is None:
                 no_date += 1
                 continue
-            if pub < cutoff:
+            # Facility distress is rare and indexed late, so it gets the longer
+            # window; a 30-hour-old pailit filing still matters.
+            item_cutoff = marunda_cutoff if it.get("source") == MARUNDA_SOURCE else cutoff
+            if pub < item_cutoff:
                 too_old += 1
                 continue
 
@@ -2717,6 +2804,11 @@ def cmd_dashboard():
             score += min(18, sum(5 for _, keywords in watch_topics for keyword in keywords if keyword in text))
             if any(key in (source or "").lower() for key in major_sources):
                 score += 8
+            # A bonded facility in trouble ranks High on its own: the goods and
+            # the unpaid duties sitting inside it are this office's exposure.
+            company, distress = marunda_alert(title)
+            if company and distress:
+                score += 45
             return max(0, min(100, score))
 
         def _priority_label(score):
@@ -2728,6 +2820,9 @@ def cmd_dashboard():
 
         def _article_reason(title, sentiment="", topic=""):
             text = (title or "").lower()
+            company, distress = marunda_alert(title)
+            if company and distress:
+                return f"Fasilitas berikat dalam tekanan ({distress}) — {company}"
             if any(term in text for term in ["kpk", "korupsi", "suap", "gratifikasi", "tersangka"]):
                 return "Reputational/legal risk signal"
             if any(term in text for term in ["dirjen", "pencopotan", "dicopot", "presiden", "menkeu", "purbaya"]):
