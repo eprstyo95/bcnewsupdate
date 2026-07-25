@@ -479,16 +479,35 @@ def build_session() -> requests.Session:
 
 
 def parse_feed(session, url):
-    """Fetch a feed through the session, then hand the bytes to feedparser.
+    """Fetch a feed, preferring the session but falling back to feedparser.
 
-    feedparser.parse(url) opens its own connection with its own user agent,
-    which several Indonesian news sites answer with a 403 or an outright
-    connection reset. Going through the session reuses the browser-like headers
-    and the retry wrapper, and lets the caller see the HTTP status.
+    Neither client wins everywhere. Several Indonesian news sites answer
+    feedparser's own opener with a 403 or a connection reset, which is why the
+    session with browser-like headers is tried first. Google News does the
+    opposite from a datacenter address: it returns 503 to the browser-like
+    request and serves feedparser's opener normally. So a failure — or a
+    suspiciously empty feed — is retried with the other client before the
+    source is called unreachable.
     """
-    resp = request_with_retry(session, "GET", url, timeout=25)
-    resp.raise_for_status()
-    return feedparser.parse(resp.content)
+    session_error = None
+    try:
+        resp = request_with_retry(session, "GET", url, timeout=25)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
+        if feed.entries:
+            return feed
+        session_error = "no entries"
+    except Exception as e:
+        session_error = f"{type(e).__name__}: {e}"
+
+    feed = feedparser.parse(url)
+    if feed.entries:
+        print(f"  ↩️ {url.split('/')[2]}: session fetch gave {session_error}, feedparser worked")
+        return feed
+
+    # Neither client got anything. Surface the session error, which carries the
+    # HTTP status, rather than feedparser's silent empty result.
+    raise RuntimeError(f"both clients failed (session: {session_error})")
 
 
 def request_with_retry(session, method, url, *, timeout=20, max_tries=3, backoff_s=1.5, **kwargs):
