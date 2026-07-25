@@ -69,15 +69,18 @@ GOOGLE_RSS_SIZE = 30
 # any user agent), Kontan (200 but zero entries). Those five failing on every
 # run is what pushed source_health "DirectRSS" past 3900 consecutive fails and
 # left the site fed almost entirely by Google News.
+#
+# Also dropped: CNBC-ID, Tempo-Bisnis and Tempo-Nasional. They serve fine from a
+# residential address but answer 403 to every client from a GitHub runner, so in
+# the place this code actually runs they are unreachable, and keeping them only
+# produces a source-health alert every five minutes. Google News still surfaces
+# both outlets' customs coverage.
 DIRECT_RSS_FEEDS = {
     "Antara-Ekonomi": "https://www.antaranews.com/rss/ekonomi.xml",
     "Antara-Hukum": "https://www.antaranews.com/rss/hukum.xml",
     "Antara-Terkini": "https://www.antaranews.com/rss/terkini.xml",
     "Detik-Finance": "https://finance.detik.com/rss",
     "Detik-News": "https://news.detik.com/berita/rss",
-    "CNBC-ID": "https://www.cnbcindonesia.com/rss",
-    "Tempo-Bisnis": "https://rss.tempo.co/bisnis",
-    "Tempo-Nasional": "https://rss.tempo.co/nasional",
     "Liputan6-Bisnis": "https://feed.liputan6.com/rss/bisnis",
     "Republika-Ekonomi": "https://www.republika.co.id/rss/ekonomi",
 }
@@ -490,12 +493,16 @@ def parse_feed(session, url):
     source is called unreachable.
     """
     session_error = None
+    session_answered = False
+    empty_feed = None
     try:
         resp = request_with_retry(session, "GET", url, timeout=25)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
+        session_answered = True
         if feed.entries:
             return feed
+        empty_feed = feed
         session_error = "no entries"
     except Exception as e:
         session_error = f"{type(e).__name__}: {e}"
@@ -505,8 +512,13 @@ def parse_feed(session, url):
         print(f"  ↩️ {url.split('/')[2]}: session fetch gave {session_error}, feedparser worked")
         return feed
 
-    # Neither client got anything. Surface the session error, which carries the
-    # HTTP status, rather than feedparser's silent empty result.
+    if session_answered:
+        # The server replied, it just had nothing to give. A dated query that
+        # matches no article is a normal quiet result, not a broken source.
+        return empty_feed
+
+    # Nothing answered. Surface the session error, which carries the HTTP status,
+    # rather than feedparser's silent empty result.
     raise RuntimeError(f"both clients failed (session: {session_error})")
 
 
