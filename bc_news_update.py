@@ -206,6 +206,18 @@ AUDIENCE_OPS = "ops"
 NEWS_ALSO_PRIVATE = os.environ.get("NEWS_ALSO_PRIVATE", "0").strip() in {"1", "true", "yes"}
 
 
+def describe_chat(chat_id):
+    """Name a chat without printing its id, which Actions masks as a secret."""
+    cid = str(chat_id or "")
+    if not cid:
+        return "unset"
+    if cid == str(TELEGRAM_PRIVATE_CHAT_ID):
+        return "private chat"
+    if cid == str(TELEGRAM_CHAT_ID):
+        return "group" if cid.startswith("-") else "configured chat"
+    return "group" if cid.startswith("-") else "direct chat"
+
+
 def audience_chat_ids(audience):
     """Chat ids for an audience, falling back to the other chat if unset.
 
@@ -729,9 +741,15 @@ def telegram_send(session, text, reply_markup=None, audience=AUDIENCE_OPS):
         return
     if _reply_target_chat_id:
         # Answering a command someone typed: reply where they asked.
+        print(f"→ telegram: reply to {describe_chat(_reply_target_chat_id)}")
         _telegram_send_one(session, _reply_target_chat_id, text, reply_markup)
         return
-    for cid in audience_chat_ids(audience):
+    targets = audience_chat_ids(audience)
+    # Chat ids are secrets, so Actions masks them in the log. Naming the audience
+    # and the kind of chat keeps routing auditable without printing an id.
+    print(f"→ telegram: audience={audience} → " +
+          (", ".join(describe_chat(cid) for cid in targets) or "no chat configured"))
+    for cid in targets:
         _telegram_send_one(session, cid, text, reply_markup)
 
 
