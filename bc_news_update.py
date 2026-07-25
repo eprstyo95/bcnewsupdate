@@ -63,15 +63,23 @@ MAX_AGE_HOURS = 24
 GOOGLE_RSS_SIZE = 30
 
 # Direct RSS feeds (faster than Google News aggregation)
+# Every URL here was re-checked on 2026-07-25. Dropped because they no longer
+# serve a feed: Antara-BC (topik/bea-cukai.xml, 404), Kompas-Ekonomi (404),
+# rss.detik.com/index.php/finance (connection reset), Bisnis-Ekonomi (403 for
+# any user agent), Kontan (200 but zero entries). Those five failing on every
+# run is what pushed source_health "DirectRSS" past 3900 consecutive fails and
+# left the site fed almost entirely by Google News.
 DIRECT_RSS_FEEDS = {
-    "Antara-BC": "https://www.antaranews.com/rss/topik/bea-cukai.xml",
     "Antara-Ekonomi": "https://www.antaranews.com/rss/ekonomi.xml",
-    "Detik-Finance": "https://rss.detik.com/index.php/finance",
-    "Kompas-Ekonomi": "https://rss.kompas.com/ekonomi",
-    "Bisnis-Ekonomi": "https://www.bisnis.com/rss/ekonomi",
+    "Antara-Hukum": "https://www.antaranews.com/rss/hukum.xml",
+    "Antara-Terkini": "https://www.antaranews.com/rss/terkini.xml",
+    "Detik-Finance": "https://finance.detik.com/rss",
+    "Detik-News": "https://news.detik.com/berita/rss",
     "CNBC-ID": "https://www.cnbcindonesia.com/rss",
-    "Kontan": "https://www.kontan.co.id/rss",
     "Tempo-Bisnis": "https://rss.tempo.co/bisnis",
+    "Tempo-Nasional": "https://rss.tempo.co/nasional",
+    "Liputan6-Bisnis": "https://feed.liputan6.com/rss/bisnis",
+    "Republika-Ekonomi": "https://www.republika.co.id/rss/ekonomi",
 }
 
 # ── CHANGE 3: Tighter direct RSS keywords ────────────────────────────────────
@@ -364,6 +372,73 @@ def find_similar_articles(item: dict, other_items: list) -> list:
     return similar
 
 
+# Tuned against a week of live data. At 0.35 two separate tin-smuggling seizures
+# merged into one story; at 0.5 a single arrest still showed up four times.
+STORY_SIMILARITY_THRESHOLD = 0.4
+
+
+def group_into_stories(articles: list, threshold: float = STORY_SIMILARITY_THRESHOLD) -> list:
+    """Collapse the syndicated copies of one event into a single story.
+
+    One arrest gets republished by a dozen outlets under near-identical
+    headlines. Listed per article, the dashboard shows that event a dozen times
+    and counts it a dozen times, which is what buried the actual signal. Each
+    story keeps its highest-scoring copy as the headline plus the outlets that
+    ran it.
+
+    Articles are matched against an inverted token index rather than every
+    earlier story, so a fortnight of articles stays well under a second.
+    """
+    stories = []
+    index = {}
+
+    for article in articles:
+        tokens = _tokenize(article.get("title", ""))
+        if not tokens:
+            continue
+
+        best, best_sim = None, 0.0
+        for pos in {p for token in tokens for p in index.get(token, ())}:
+            story = stories[pos]
+            overlap = len(tokens & story["tokens"])
+            if not overlap:
+                continue
+            sim = overlap / len(tokens | story["tokens"])
+            if sim > best_sim:
+                best, best_sim = story, sim
+
+        if best is not None and best_sim >= threshold:
+            best["articles"].append(article)
+            continue
+
+        story = {"tokens": tokens, "articles": [article]}
+        stories.append(story)
+        for token in tokens:
+            index.setdefault(token, []).append(len(stories) - 1)
+
+    for story in stories:
+        copies = story["articles"]
+        lead = max(copies, key=lambda a: (a.get("score", 0), a.get("seen")))
+        outlets = []
+        for copy in copies:
+            name = copy.get("source") or ""
+            if name and name not in outlets:
+                outlets.append(name)
+        negative = sum(1 for c in copies if c.get("sentiment") == "Negatif")
+        story.update({
+            **lead,
+            "outlets": outlets,
+            "outlet_count": len(outlets),
+            "copies": len(copies),
+            "negative_copies": negative,
+            "seen": max(c["seen"] for c in copies),
+            "first_seen": min(c["seen"] for c in copies),
+        })
+        story.pop("tokens", None)
+
+    return stories
+
+
 def deduplicate_fuzzy(items: list) -> list:
     unique = []
     seen_titles = []
@@ -392,8 +467,28 @@ def deduplicate_fuzzy(items: list) -> list:
 # =========================
 def build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (bc-news-bot)"})
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+    })
     return s
+
+
+def parse_feed(session, url):
+    """Fetch a feed through the session, then hand the bytes to feedparser.
+
+    feedparser.parse(url) opens its own connection with its own user agent,
+    which several Indonesian news sites answer with a 403 or an outright
+    connection reset. Going through the session reuses the browser-like headers
+    and the retry wrapper, and lets the caller see the HTTP status.
+    """
+    resp = request_with_retry(session, "GET", url, timeout=25)
+    resp.raise_for_status()
+    return feedparser.parse(resp.content)
 
 
 def request_with_retry(session, method, url, *, timeout=20, max_tries=3, backoff_s=1.5, **kwargs):
@@ -509,6 +604,23 @@ def init_db(con: sqlite3.Connection):
         )
     """)
 
+    # consecutive_fails used to count runs that yielded no matching article, which
+    # is the normal case for a general-interest feed on a quiet day. That buried
+    # the feeds that were genuinely unreachable. Reachability is tracked here.
+    cur.execute("PRAGMA table_info(source_health)")
+    health_cols = {row[1] for row in cur.fetchall()}
+    for col_name, col_type in {
+        "consecutive_empty": "INTEGER DEFAULT 0",
+        "last_error": "TEXT DEFAULT ''",
+    }.items():
+        if col_name not in health_cols:
+            cur.execute(f"ALTER TABLE source_health ADD COLUMN {col_name} {col_type}")
+            print(f"  ➕ Added column: source_health.{col_name}")
+
+    # Direct feeds are tracked one row per feed now, so the old lumped rows only
+    # carry counters no live code updates.
+    cur.execute("DELETE FROM source_health WHERE source_name IN ('DirectRSS', 'GoogleNews RSS')")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
             key TEXT PRIMARY KEY,
@@ -551,39 +663,56 @@ def mark_seen(con, fp, url, title, source="", sentiment_label="", sentiment_scor
 # =========================
 # SOURCE HEALTH
 # =========================
-def record_source_health(con, source_name, article_count):
+def record_source_health(con, source_name, article_count, reachable=True, error=""):
+    """Record one fetch of a source.
+
+    `reachable` is whether the feed answered at all. A feed that answers with
+    nothing about customs is healthy — only unreachable ones raise
+    consecutive_fails, which is what the alerts and the dashboard act on.
+    """
     cur = con.cursor()
     now = datetime.now(timezone.utc).isoformat()
-    cur.execute("SELECT consecutive_fails, total_fetches, total_articles FROM source_health WHERE source_name = ?",
-                (source_name,))
+    cur.execute("""SELECT consecutive_fails, consecutive_empty, total_fetches, total_articles
+                   FROM source_health WHERE source_name = ?""", (source_name,))
     row = cur.fetchone()
     if row is None:
-        if article_count > 0:
-            cur.execute("INSERT INTO source_health (source_name, last_success_utc, consecutive_fails, total_fetches, total_articles) VALUES (?, ?, 0, 1, ?)",
-                        (source_name, now, article_count))
-        else:
-            cur.execute("INSERT INTO source_health (source_name, last_fail_utc, consecutive_fails, total_fetches, total_articles) VALUES (?, ?, 1, 1, 0)",
-                        (source_name, now))
+        cur.execute("""INSERT INTO source_health
+                       (source_name, last_success_utc, last_fail_utc, consecutive_fails,
+                        consecutive_empty, total_fetches, total_articles, last_error)
+                       VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
+                    (source_name,
+                     now if reachable else None,
+                     None if reachable else now,
+                     0 if reachable else 1,
+                     0 if article_count > 0 else 1,
+                     article_count,
+                     "" if reachable else error[:200]))
     else:
-        cf, tf, ta = row
+        cf, ce, tf, ta = row
         tf += 1
         ta += article_count
-        if article_count > 0:
-            cur.execute("UPDATE source_health SET last_success_utc=?, consecutive_fails=0, total_fetches=?, total_articles=? WHERE source_name=?",
-                        (now, tf, ta, source_name))
+        if reachable:
+            cur.execute("""UPDATE source_health SET last_success_utc=?, consecutive_fails=0,
+                           consecutive_empty=?, total_fetches=?, total_articles=?, last_error=''
+                           WHERE source_name=?""",
+                        (now, 0 if article_count > 0 else (ce or 0) + 1, tf, ta, source_name))
         else:
-            cur.execute("UPDATE source_health SET last_fail_utc=?, consecutive_fails=?, total_fetches=?, total_articles=? WHERE source_name=?",
-                        (now, cf + 1, tf, ta, source_name))
+            cur.execute("""UPDATE source_health SET last_fail_utc=?, consecutive_fails=?,
+                           total_fetches=?, total_articles=?, last_error=? WHERE source_name=?""",
+                        ((now), (cf or 0) + 1, tf, ta, error[:200], source_name))
     con.commit()
 
 
 def check_source_health_alerts(con):
     SILENT_SOURCES = {"GoogleNews-EN"}
     cur = con.cursor()
-    cur.execute("SELECT source_name, consecutive_fails, last_success_utc FROM source_health WHERE consecutive_fails >= 3")
+    cur.execute("""SELECT source_name, consecutive_fails, last_success_utc, last_error
+                   FROM source_health WHERE consecutive_fails >= 3""")
     return [
-        f"⚠️ <b>{html.escape(name)}</b> returned 0 articles {fails}x in a row. Last OK: {html.escape(last_ok or 'never')}"
-        for name, fails, last_ok in cur.fetchall()
+        f"⚠️ <b>{html.escape(name)}</b> unreachable {fails}x in a row"
+        f"{(': ' + html.escape(err[:80])) if err else ''}. "
+        f"Last OK: {html.escape(last_ok or 'never')}"
+        for name, fails, last_ok, err in cur.fetchall()
         if name not in SILENT_SOURCES
     ]
 
@@ -998,7 +1127,7 @@ def fetch_google_news_rss(session, query, language="id"):
     else:
         rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en&gl=US&ceid=US:en"
 
-    feed = feedparser.parse(rss_url)
+    feed = parse_feed(session, rss_url)
     out = []
     for entry in feed.entries[:GOOGLE_RSS_SIZE]:
         pub = entry_published_utc(entry)
@@ -1023,11 +1152,13 @@ def _matches_direct_keywords(title: str, description: str = "") -> bool:
 
 
 def fetch_direct_rss(session):
+    """Returns (items, per_feed_counts) so each feed gets its own health row."""
     all_items = []
+    per_feed = {}
 
     for feed_name, feed_url in DIRECT_RSS_FEEDS.items():
         try:
-            feed = feedparser.parse(feed_url)
+            feed = parse_feed(session, feed_url)
             count = 0
             for entry in feed.entries[:30]:
                 title = (entry.get("title") or "").strip()
@@ -1050,11 +1181,13 @@ def fetch_direct_rss(session):
                 })
                 count += 1
 
+            per_feed[feed_name] = (count, True, "")
             print(f"  RSS {feed_name}: {count} matched / {len(feed.entries)} total")
         except Exception as e:
-            print(f"  ⚠️ RSS {feed_name} failed: {e}")
+            per_feed[feed_name] = (0, False, f"{type(e).__name__}: {e}")
+            print(f"  ⚠️ RSS {feed_name} failed: {type(e).__name__}: {e}")
 
-    return all_items
+    return all_items, per_feed
 
 
 # =============================================================================
@@ -1069,14 +1202,27 @@ def cmd_run():
         now_utc = datetime.now(timezone.utc)
         cutoff = now_utc - timedelta(hours=MAX_AGE_HOURS)
 
-        rss_id = fetch_google_news_rss(session, QUERY_RSS_ID, language="id")
-        record_source_health(con, "GoogleNews-ID", len(rss_id))
+        try:
+            rss_id = fetch_google_news_rss(session, QUERY_RSS_ID, language="id")
+            record_source_health(con, "GoogleNews-ID", len(rss_id))
+        except Exception as e:
+            rss_id = []
+            record_source_health(con, "GoogleNews-ID", 0, reachable=False,
+                                 error=f"{type(e).__name__}: {e}")
+            print(f"  ⚠️ GoogleNews-ID failed: {type(e).__name__}: {e}")
 
-        rss_en = fetch_google_news_rss(session, QUERY_RSS_EN, language="en")
-        record_source_health(con, "GoogleNews-EN", len(rss_en))
+        try:
+            rss_en = fetch_google_news_rss(session, QUERY_RSS_EN, language="en")
+            record_source_health(con, "GoogleNews-EN", len(rss_en))
+        except Exception as e:
+            rss_en = []
+            record_source_health(con, "GoogleNews-EN", 0, reachable=False,
+                                 error=f"{type(e).__name__}: {e}")
+            print(f"  ⚠️ GoogleNews-EN failed: {type(e).__name__}: {e}")
 
-        direct_items = fetch_direct_rss(session)
-        record_source_health(con, "DirectRSS", len(direct_items))
+        direct_items, direct_health = fetch_direct_rss(session)
+        for feed_name, (count, reachable, error) in direct_health.items():
+            record_source_health(con, feed_name, count, reachable=reachable, error=error)
 
         items = rss_id + rss_en + direct_items
 
@@ -2381,27 +2527,20 @@ def cmd_dashboard():
             tone_sources[domain][label] = tone_sources[domain].get(label, 0) + 1
             tone_sources[domain]["total"] += 1
 
+        # A two-article minimum ranked outlets that ran one positive piece at a
+        # perfect +1.00, so the panel listed unknown sites and never the ones
+        # that actually drive coverage. Eight is enough for the average to mean
+        # something, and both ends are shown rather than the top twelve.
+        MIN_ARTICLES_FOR_TONE = 8
         tone_data = []
         for src, data in tone_sources.items():
-            if data["total"] < 2 or not src:
+            if data["total"] < MIN_ARTICLES_FOR_TONE or not src:
                 continue
             tone = round((data["Positif"] - data["Negatif"]) / data["total"], 2)
             tone_data.append({"source": src, "tone": tone, **data})
         tone_data.sort(key=lambda x: x["tone"], reverse=True)
-        tone_data = tone_data[:12]
-
-        lang_daily = []
-        for d in range(29, -1, -1):
-            day = now_utc - timedelta(days=d)
-            ds = day.replace(hour=0, minute=0, second=0).isoformat()
-            de = day.replace(hour=23, minute=59, second=59).isoformat()
-            cur.execute("SELECT language, COUNT(*) FROM seen WHERE first_seen_utc >= ? AND first_seen_utc <= ? GROUP BY language", (ds, de))
-            counts = dict(cur.fetchall())
-            lang_daily.append({
-                "date": day.strftime("%d/%m"),
-                "id": counts.get("id", 0),
-                "en": counts.get("en", 0),
-            })
+        if len(tone_data) > 12:
+            tone_data = tone_data[:6] + tone_data[-6:]
 
         month_cut = (now_utc - timedelta(days=30)).isoformat()
         cur.execute("SELECT COUNT(*) FROM seen WHERE first_seen_utc >= ?", (month_cut,))
@@ -2437,31 +2576,11 @@ def cmd_dashboard():
                     (last_week_cut, week_cut))
         lw_sent = dict(cur.fetchall())
 
-        cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Positif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
-        top_positive = [{"title": t, "url": u, "source": _publisher_from_title(t, u, s)} for t, u, s, _ in cur.fetchall()]
-        cur.execute("SELECT title, url, source, sentiment_label FROM seen WHERE first_seen_utc >= ? AND sentiment_label = 'Negatif' ORDER BY first_seen_utc DESC LIMIT 5", (week_cut,))
-        top_negative = [{"title": t, "url": u, "source": _publisher_from_title(t, u, s)} for t, u, s, _ in cur.fetchall()]
-
+        # 30 days, not 14: the risk timeline below plots 30 days, so a 14-day
+        # window left its first sixteen days pinned at zero.
         cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
                        FROM seen WHERE first_seen_utc >= ? AND title != ''
-                       ORDER BY first_seen_utc DESC LIMIT 50""", (week_cut,))
-        recent_articles = []
-        for title, url, source, sent, seen_utc, tags, lang in cur.fetchall():
-            try:
-                dt = datetime.fromisoformat(seen_utc).astimezone(WIB)
-                time_str = dt.strftime("%d/%m %H:%M")
-            except Exception:
-                time_str = ""
-            display_src = _publisher_from_title(title, url, source)
-            recent_articles.append({
-                "title": title or "", "url": url or "", "source": display_src,
-                "sentiment": sent or "Netral", "time": time_str,
-                "tags": (tags or "").split()[:3], "lang": lang or "id",
-            })
-
-        cur.execute("""SELECT title, url, source, sentiment_label, first_seen_utc, hashtags, language
-                       FROM seen WHERE first_seen_utc >= ? AND title != ''
-                       ORDER BY first_seen_utc DESC""", (last_week_cut,))
+                       ORDER BY first_seen_utc DESC""", (month_cut,))
         article_rows = []
         for title, url, source, sent, seen_utc, tags, lang in cur.fetchall():
             try:
@@ -2491,17 +2610,28 @@ def cmd_dashboard():
         week_articles = [a for a in article_rows if a["seen"] >= week_start_dt]
         prev_week_articles = [a for a in article_rows if prev_week_start_dt <= a["seen"] < week_start_dt]
         today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_dt = now_utc - timedelta(hours=24)
         today_articles = [a for a in week_articles if a["seen"] >= today_start]
+
+        # Everything below counts stories, not articles: one event syndicated by
+        # fifteen outlets is one thing that happened, and counting the copies made
+        # every panel here read as fifteen.
+        week_stories = group_into_stories(week_articles)
+        prev_week_stories = group_into_stories(prev_week_articles)
+        story_sent = Counter(s["sentiment"] for s in week_stories)
+        prev_story_sent = Counter(s["sentiment"] for s in prev_week_stories)
+        today_stories = [s for s in week_stories if s["seen"] >= today_start]
+        day_stories = [s for s in week_stories if s["seen"] >= day_start_dt]
 
         watchlist_data = []
         for label, keywords in watch_topics:
-            def matches(article):
-                text = f"{article['title']} {' '.join(article.get('tags', []))}".lower()
+            def matches(story):
+                text = f"{story['title']} {' '.join(story.get('tags', []))}".lower()
                 return any(keyword in text for keyword in keywords)
-            current_matches = [a for a in week_articles if matches(a)]
-            previous_matches = [a for a in prev_week_articles if matches(a)]
-            today_matches = [a for a in today_articles if matches(a)]
-            latest = current_matches[0] if current_matches else None
+            current_matches = [s for s in week_stories if matches(s)]
+            previous_matches = [s for s in prev_week_stories if matches(s)]
+            today_matches = [s for s in today_stories if matches(s)]
+            latest = max(current_matches, key=lambda s: s["seen"]) if current_matches else None
             watchlist_data.append({
                 "topic": label,
                 "today": len(today_matches),
@@ -2515,96 +2645,165 @@ def cmd_dashboard():
 
         cluster_data = []
         for label, _ in watch_topics:
-            current = [a for a in week_articles if a["topic"] == label]
-            previous = [a for a in prev_week_articles if a["topic"] == label]
+            current = sorted([s for s in week_stories if s["topic"] == label],
+                             key=lambda s: s["seen"], reverse=True)
+            previous = [s for s in prev_week_stories if s["topic"] == label]
             if not current:
                 continue
-            sources = {a["source"] for a in current if a["source"]}
-            neg = sum(1 for a in current if a["sentiment"] == "Negatif")
+            outlets = {name for s in current for name in s["outlets"] if name}
+            neg = sum(1 for s in current if s["sentiment"] == "Negatif")
             cluster_data.append({
                 "topic": label,
-                "articles": len(current),
-                "sources": len(sources),
+                "stories": len(current),
+                "articles": sum(s["copies"] for s in current),
+                "sources": len(outlets),
                 "negative": neg,
                 "trend": len(current) - len(previous),
                 "latest": current[0]["title"],
                 "url": current[0]["url"],
                 "tone": "negative" if neg / max(len(current), 1) >= 0.35 else "mixed",
             })
-        cluster_data.sort(key=lambda x: (x["articles"] + max(x["trend"], 0), x["negative"]), reverse=True)
+        cluster_data.sort(key=lambda x: (x["stories"] + max(x["trend"], 0), x["negative"]), reverse=True)
         cluster_data = cluster_data[:8]
 
-        priority_articles = sorted(
-            [a for a in week_articles if a["score"] >= 38],
-            key=lambda a: (a["score"], a["seen"]),
+        priority_stories = sorted(
+            [s for s in week_stories if s["score"] >= 38],
+            key=lambda s: (s["score"], s["outlet_count"], s["seen"]),
             reverse=True
         )[:18]
         priority_articles = [{
-            "priority": a["priority"], "score": a["score"], "topic": a["topic"],
-            "title": a["title"], "url": a["url"], "source": a["source"],
-            "sentiment": a["sentiment"], "time": a["time"], "reason": a["reason"],
-        } for a in priority_articles]
+            "priority": s["priority"], "score": s["score"], "topic": s["topic"],
+            "title": s["title"], "url": s["url"], "source": s["source"],
+            "sentiment": s["sentiment"], "time": s["time"], "reason": s["reason"],
+            "outlets": s["outlets"][:8], "outlet_count": s["outlet_count"],
+        } for s in priority_stories]
+
+        # The feed shows one card per story, newest first, with the other outlets
+        # that carried it folded into the card.
+        recent_articles = [{
+            "title": s["title"], "url": s["url"], "source": s["source"],
+            "sentiment": s["sentiment"], "time": s["time"], "tags": s["tags"],
+            "lang": s["lang"], "topic": s["topic"], "score": s["score"],
+            "priority": s["priority"], "outlets": s["outlets"][:8],
+            "outlet_count": s["outlet_count"],
+        } for s in sorted(week_stories, key=lambda s: s["seen"], reverse=True)[:80]]
+
+        # Both lists are story-level as well, otherwise the same headline filled
+        # all five slots from five different outlets.
+        by_recency = sorted(week_stories, key=lambda s: s["seen"], reverse=True)
+        top_positive = [{"title": s["title"], "url": s["url"], "source": s["source"]}
+                        for s in by_recency if s["sentiment"] == "Positif"][:5]
+        top_negative = [{"title": s["title"], "url": s["url"], "source": s["source"]}
+                        for s in by_recency if s["sentiment"] == "Negatif"][:5]
 
         risk_daily = []
         for d in range(29, -1, -1):
             day = now_utc - timedelta(days=d)
             start = day.replace(hour=0, minute=0, second=0, microsecond=0)
             end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
-            articles_for_day = [a for a in article_rows if start <= a["seen"] <= end]
-            neg = sum(1 for a in articles_for_day if a["sentiment"] == "Negatif")
-            high = sum(1 for a in articles_for_day if a["score"] >= 65)
-            score = min(100, round((neg * 3.5) + (high * 7) + (len(articles_for_day) * 0.08)))
-            risk_daily.append({"date": day.strftime("%d/%m"), "score": score, "negative": neg, "high": high})
+            stories_for_day = group_into_stories(
+                [a for a in article_rows if start <= a["seen"] <= end])
+            neg = sum(1 for s in stories_for_day if s["sentiment"] == "Negatif")
+            high = sum(1 for s in stories_for_day if s["score"] >= 65)
+            day_total = max(len(stories_for_day), 1)
+            score = min(100, round(((neg / day_total) * 55) + ((high / day_total) * 40)
+                                   + min(5, len(stories_for_day) * 0.15)))
+            risk_daily.append({"date": day.strftime("%d/%m"), "score": score,
+                               "negative": neg, "high": high, "stories": len(stories_for_day)})
 
         major_media = []
         for key, label in major_sources.items():
-            matched = [a for a in week_articles if key in a["source"].lower() or key in a["title"].lower()]
+            matched = sorted(
+                [s for s in week_stories
+                 if any(key in outlet.lower() for outlet in s["outlets"]) or key in s["title"].lower()],
+                key=lambda s: s["seen"], reverse=True)
             if not matched:
                 continue
             major_media.append({
                 "source": label,
                 "articles": len(matched),
-                "negative": sum(1 for a in matched if a["sentiment"] == "Negatif"),
+                "negative": sum(1 for s in matched if s["sentiment"] == "Negatif"),
                 "latest": matched[0]["title"],
             })
         major_media.sort(key=lambda x: (x["articles"], x["negative"]), reverse=True)
         major_media = major_media[:10]
 
-        high_count = sum(1 for a in week_articles if a["score"] >= 65)
+        # Each component is a share of the week's stories and is capped, so the
+        # score can move. The previous formula added raw counts (3 points per
+        # high-priority article, 1.5 per major-media negative) and hit the 100
+        # ceiling on any ordinary week, which made the headline number constant.
+        total_stories = max(len(week_stories), 1)
+        high_stories = [s for s in week_stories if s["score"] >= 65]
+        high_count = len(high_stories)
+        negative_stories = sum(1 for s in week_stories if s["sentiment"] == "Negatif")
         major_negative = sum(item["negative"] for item in major_media)
-        neg_share = (wk_sent.get("Negatif", 0) / max(total_7d, 1)) * 100
+        neg_share = (negative_stories / total_stories) * 100
+        high_share = (high_count / total_stories) * 100
         rising_topics = sum(1 for c in cluster_data if c["trend"] > 0)
-        risk_score = min(100, round(neg_share * 1.2 + high_count * 3 + major_negative * 1.5 + rising_topics * 4))
+
+        risk_parts = [
+            ("Negative share", round(min(40, neg_share * 0.8))),
+            ("High-priority share", round(min(35, high_share * 1.2))),
+            ("Major-media negatives", round(min(15, major_negative * 1.5))),
+            ("Rising topics", round(min(10, rising_topics * 2.5))),
+        ]
+        risk_score = min(100, sum(value for _, value in risk_parts))
         risk_label = "High" if risk_score >= 70 else "Medium" if risk_score >= 40 else "Low"
         top_cluster = cluster_data[0] if cluster_data else {}
         situation = {
             "risk_score": risk_score,
             "risk_label": risk_label,
+            "risk_parts": [{"label": label, "value": value} for label, value in risk_parts],
             "top_issue": top_cluster.get("topic", top_10_tags[0] if top_10_tags else "No issue detected"),
             "spike_topic": max(cluster_data, key=lambda c: c["trend"], default={}).get("topic", "No spike"),
             "major_media_count": sum(item["articles"] for item in major_media),
             "high_priority_count": high_count,
+            "stories_7d": len(week_stories),
+            "stories_prev_week": len(prev_week_stories),
+            "stories_24h": len(day_stories),
+            "articles_7d": len(week_articles),
+            "top_stories_24h": [{
+                "title": s["title"], "url": s["url"], "source": s["source"],
+                "outlet_count": s["outlet_count"], "score": s["score"],
+                "priority": s["priority"], "topic": s["topic"], "time": s["time"],
+                "reason": s["reason"], "sentiment": s["sentiment"],
+            } for s in sorted(day_stories, key=lambda s: (s["score"], s["outlet_count"]), reverse=True)[:5]],
         }
 
-        cur.execute("""SELECT source_name, consecutive_fails, total_fetches, total_articles,
-                              last_success_utc, last_fail_utc
+        cur.execute("""SELECT source_name, consecutive_fails, consecutive_empty, total_fetches,
+                              total_articles, last_success_utc, last_fail_utc, last_error
                        FROM source_health ORDER BY source_name""")
         source_health = []
-        for name, fails, fetches, articles, last_success, last_fail in cur.fetchall():
+        for name, fails, empty, fetches, articles, last_success, last_fail, last_error in cur.fetchall():
+            # "unreachable" is the only state worth acting on. A feed that simply
+            # had nothing about customs is reported as quiet, not as broken.
+            if (fails or 0) >= 3:
+                status, note = "down", f"unreachable {fails}x"
+            elif (fails or 0) > 0:
+                status, note = "warning", f"unreachable {fails}x"
+            elif (empty or 0) >= 24:
+                status, note = "quiet", f"no match in {empty} runs"
+            else:
+                status, note = "ok", "ok"
             source_health.append({
                 "source": name or "",
-                "status": "warning" if (fails or 0) > 0 else "ok",
+                "status": status,
+                "note": note,
                 "fails": fails or 0,
+                "empty": empty or 0,
                 "fetches": fetches or 0,
                 "articles": articles or 0,
                 "avg": round((articles or 0) / max(fetches or 0, 1), 1),
                 "last_success": last_success or "",
                 "last_fail": last_fail or "",
+                "last_error": (last_error or "")[:120],
             })
+        source_health.sort(key=lambda s: ({"down": 0, "warning": 1, "quiet": 2, "ok": 3}[s["status"]], s["source"]))
 
         data_quality = {
             "sources_ok": sum(1 for s in source_health if s["status"] == "ok"),
-            "sources_warning": sum(1 for s in source_health if s["status"] != "ok"),
+            "sources_warning": sum(1 for s in source_health if s["status"] in ("down", "warning")),
+            "sources_down": [s["source"] for s in source_health if s["status"] == "down"],
             "recent_articles": len(recent_articles),
             "tracked_30d": total_30d,
             "last_seen": last_seen_wib,
@@ -2614,37 +2813,47 @@ def cmd_dashboard():
         brief_lines = [
             f"BC News Brief - {now_wib.strftime('%d %b %Y %H:%M WIB')}",
             f"Risk: {risk_label} ({risk_score}/100)",
-            f"7d articles: {total_7d} | Negative: {wk_sent.get('Negatif', 0)} ({round(neg_share)}%)",
+            f"7d: {len(week_stories)} stories from {len(week_articles)} articles | "
+            f"Negative stories: {negative_stories} ({round(neg_share)}%)",
+            f"Last 24h: {len(day_stories)} new stories",
             f"Top issue: {situation['top_issue']}",
             f"Spike topic: {situation['spike_topic']}",
-            "Priority articles:",
+            "Top stories (24h):",
         ]
-        for item in priority_articles[:5]:
-            brief_lines.append(f"- [{item['priority']}] {item['title'][:110]}")
+        for item in situation["top_stories_24h"]:
+            outlets = f" [{item['outlet_count']} outlets]" if item["outlet_count"] > 1 else ""
+            brief_lines.append(f"- [{item['priority']}] {item['title'][:110]}{outlets}")
+        if data_quality["sources_down"]:
+            brief_lines.append("Feeds down: " + ", ".join(data_quality["sources_down"]))
         copy_brief = "\n".join(brief_lines)
 
         dashboard_json = json.dumps({
             "generated": now_wib.strftime("%d %b %Y %H:%M WIB"),
+            # Sentiment is counted per story too. Mixing story counts with article
+            # counts on the same screen made the three sentiment cards add up to a
+            # different total than the story card right next to them.
             "summary": {
                 "total_30d": total_30d,
                 "total_7d": total_7d,
-                "positif_7d": wk_sent.get("Positif", 0),
-                "negatif_7d": wk_sent.get("Negatif", 0),
-                "netral_7d": wk_sent.get("Netral", 0),
+                "stories_7d": len(week_stories),
+                "stories_prev_week": len(prev_week_stories),
+                "stories_24h": len(day_stories),
+                "positif_7d": story_sent.get("Positif", 0),
+                "negatif_7d": story_sent.get("Negatif", 0),
+                "netral_7d": story_sent.get("Netral", 0),
                 "last_seen": last_seen_wib,
             },
             "wow": {
-                "lw_total": lw_total,
-                "lw_positif": lw_sent.get("Positif", 0),
-                "lw_negatif": lw_sent.get("Negatif", 0),
-                "lw_netral": lw_sent.get("Netral", 0),
+                "lw_total": len(prev_week_stories),
+                "lw_positif": prev_story_sent.get("Positif", 0),
+                "lw_negatif": prev_story_sent.get("Negatif", 0),
+                "lw_netral": prev_story_sent.get("Netral", 0),
             },
             "daily_sentiment": daily_data,
             "sources": source_data,
             "heatmap_tags": top_10_tags,
             "heatmap": heatmap_data,
             "tone": tone_data,
-            "lang_daily": lang_daily,
             "reactions": reaction_data,
             "top_positive": top_positive,
             "top_negative": top_negative,
@@ -2774,6 +2983,15 @@ def _build_dashboard_html(data_json: str) -> str:
   .status-pill {{ border-radius: 999px; padding: 3px 8px; font-size: 0.68rem; font-weight: 700; }}
   .status-ok {{ background: rgba(34,197,94,0.14); color: #86efac; }}
   .status-warning {{ background: rgba(251,191,36,0.14); color: #fde68a; }}
+  .status-down {{ background: rgba(239,68,68,0.18); color: #fca5a5; }}
+  .status-quiet {{ background: rgba(148,163,184,0.14); color: #cbd5e1; }}
+  .alert-card {{ background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.35);
+    color: #fecaca; padding: 12px 14px; margin-bottom: 14px; font-size: 0.85rem; }}
+  .risk-parts {{ margin-top: 10px; border-top: 1px solid rgba(148,163,184,0.18); padding-top: 8px; }}
+  .risk-part {{ display: flex; justify-content: space-between; color: #cbd5e1;
+    font-size: 0.72rem; padding: 2px 0; }}
+  .outlet-chip {{ background: rgba(99,102,241,0.16); color: #c7d2fe; border-radius: 999px;
+    padding: 1px 7px; font-size: 0.68rem; margin-left: 6px; white-space: nowrap; }}
   .risk-card {{ background: linear-gradient(135deg, rgba(248,113,113,0.16), rgba(30,41,59,1)); }}
   .risk-score {{ font-size: 3rem; font-weight: 900; line-height: 1; }}
   .risk-label {{ display: inline-flex; margin-top: 8px; border-radius: 999px; padding: 4px 10px;
@@ -2796,6 +3014,9 @@ def _build_dashboard_html(data_json: str) -> str:
   .item-top {{ display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }}
   .item-title {{ font-weight: 800; color: #e2e8f0; }}
   .item-meta {{ color: #94a3b8; font-size: 0.72rem; margin-top: 4px; line-height: 1.35; }}
+  .item-meta a {{ color: #bfdbfe; text-decoration: none; font-size: 0.78rem; display: block;
+    margin-top: 2px; overflow-wrap: anywhere; }}
+  .item-meta a:hover {{ text-decoration: underline; }}
   .brief-box {{ width: 100%; min-height: 160px; resize: vertical; background: #0f172a; color: #dbeafe;
                 border: 1px solid #1e3a5f; border-radius: 12px; padding: 12px; font: inherit;
                 font-size: 0.8rem; line-height: 1.45; }}
@@ -2817,12 +3038,21 @@ def _build_dashboard_html(data_json: str) -> str:
   </div>
   <div class="subtitle" id="generated"></div>
 
+  <div id="feedAlert"></div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>Last 24 Hours</h2>
+    <div class="metric-note" id="dayNote"></div>
+    <div class="cluster-list" id="dayStories"></div>
+  </div>
+
   <div class="grid-3">
     <div class="card risk-card">
       <h2>Situation Risk</h2>
       <div class="risk-score" id="riskScore">-</div>
       <div class="risk-label" id="riskLabel">Loading</div>
       <div class="metric-note" id="riskNote"></div>
+      <div class="risk-parts" id="riskParts"></div>
     </div>
     <div class="card">
       <h2>Top Issue</h2>
@@ -2840,9 +3070,10 @@ def _build_dashboard_html(data_json: str) -> str:
 
   <div class="grid-3">
     <div class="card">
-      <h2>Total Minggu Ini</h2>
+      <h2>Cerita Minggu Ini</h2>
       <div class="stat"><div class="num" id="total7d">-</div>
       <div class="change" id="wowTotal"></div></div>
+      <div class="metric-note" id="storiesNote"></div>
     </div>
     <div class="card">
       <h2>Sentimen Positif</h2>
@@ -2879,13 +3110,6 @@ def _build_dashboard_html(data_json: str) -> str:
     <div class="card">
       <h2>📈 Sentimen Harian (30 hari)</h2>
       <canvas id="sentimentChart"></canvas>
-    </div>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <h2>🌍 Bahasa (30 hari)</h2>
-      <canvas id="langChart"></canvas>
     </div>
   </div>
 
@@ -2977,12 +3201,12 @@ def _build_dashboard_html(data_json: str) -> str:
     </div>
   </div>
 
-  <div class="card" style="margin-bottom:14px">
+  <div class="card" style="margin-bottom:14px" id="reactionsCard" hidden>
     <h2>👍 Top Voted Articles</h2>
     <div id="reactionsContainer"></div>
   </div>
 
-  <div class="footer">BC News Monitor v3.1 — Auto-generated dashboard — Powered by Google News RSS</div>
+  <div class="footer">BC News Monitor v3.1 — Auto-generated dashboard — Google News + direct RSS</div>
 </div>
 
 <script>
@@ -3097,19 +3321,53 @@ function wowArrow(curr, prev) {{
 }}
 
 byId('generated').textContent = 'Last updated: ' + D.generated;
-byId('total7d').textContent = D.summary.total_7d;
+byId('total7d').textContent = D.summary.stories_7d != null ? D.summary.stories_7d : D.summary.total_7d;
+byId('storiesNote').textContent = 'dari ' + esc(D.summary.total_7d) + ' artikel (duplikat digabung)';
 byId('total30d').textContent = D.summary.total_30d;
 byId('pos7d').textContent = D.summary.positif_7d;
 byId('neg7d').textContent = D.summary.negatif_7d;
 byId('neu7d').textContent = D.summary.netral_7d;
 byId('avgDaily').textContent = (D.summary.total_30d / 30).toFixed(1);
 
-byId('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.total_7d, D.wow.lw_total);
+byId('wowTotal').innerHTML = 'vs minggu lalu: ' + wowArrow(
+  D.summary.stories_7d != null ? D.summary.stories_7d : D.summary.total_7d,
+  D.summary.stories_prev_week != null ? D.summary.stories_prev_week : D.wow.lw_total);
 byId('wowPos').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.positif_7d, D.wow.lw_positif);
 byId('wowNeg').innerHTML = 'vs minggu lalu: ' + wowArrow(D.summary.negatif_7d, D.wow.lw_negatif);
 byId('riskScore').textContent = D.situation.risk_score;
 byId('riskLabel').textContent = D.situation.risk_label + ' attention';
-byId('riskNote').textContent = 'Negative share, high-priority items, major-media coverage, and rising clusters.';
+byId('riskNote').textContent = 'Share of this week’s stories, not raw counts.';
+const riskPartsEl = byId('riskParts');
+if (riskPartsEl && (D.situation.risk_parts || []).length) {{
+  riskPartsEl.innerHTML = D.situation.risk_parts.map(p =>
+    '<div class="risk-part"><span>' + esc(p.label) + '</span><span>+' + esc(p.value) + '</span></div>'
+  ).join('');
+}}
+
+const dayStoriesEl = byId('dayStories');
+const dayStories = D.situation.top_stories_24h || [];
+byId('dayNote').textContent = (D.summary.stories_24h != null ? D.summary.stories_24h : dayStories.length) +
+  ' cerita baru dalam 24 jam terakhir' + (dayStories.length ? ' — teratas menurut skor prioritas:' : '.');
+if (dayStories.length) {{
+  dayStoriesEl.innerHTML = dayStories.map(s => '<div class="cluster-item">' +
+    '<div class="item-top">' +
+      '<a class="item-title" href="' + safeUrl(s.url) + '" target="_blank" rel="noopener noreferrer">' +
+        esc(String(s.title || '').slice(0, 150)) + '</a>' +
+      '<span class="pill ' + priorityClass(s.priority) + '">' + esc(s.priority) + ' ' + esc(s.score) + '/100</span>' +
+    '</div>' +
+    '<div class="item-meta">' + esc(s.topic || '') + ' | ' + esc(s.source || '') +
+      (Number(s.outlet_count || 1) > 1 ? ' +' + esc(Number(s.outlet_count) - 1) + ' outlet lain' : '') +
+      ' | ' + esc(s.time || '') + ' | ' + esc(s.reason || '') + '</div>' +
+  '</div>').join('');
+}} else {{
+  dayStoriesEl.innerHTML = empty('Belum ada cerita baru dalam 24 jam terakhir.');
+}}
+
+const downFeeds = (D.data_quality && D.data_quality.sources_down) || [];
+if (downFeeds.length) {{
+  byId('feedAlert').innerHTML = '<div class="card alert-card">⚠️ Feed tidak bisa diakses: <b>' +
+    downFeeds.map(esc).join(', ') + '</b> — berita dari sumber ini tidak masuk.</div>';
+}}
 byId('topIssue').textContent = D.situation.top_issue;
 byId('spikeTopic').textContent = 'Spike topic: ' + D.situation.spike_topic;
 byId('highPriorityCount').textContent = D.situation.high_priority_count;
@@ -3154,21 +3412,6 @@ new Chart(document.getElementById('sentimentChart'), {{
   options: {{ responsive: true, interaction: {{ intersect: false, mode: 'index' }},
     plugins: {{ legend: {{ position: 'bottom', labels: {{ usePointStyle: true, padding: 16 }} }} }},
     scales: {{ x: {{ ticks: {{ maxTicksLimit: 8, font: {{ size: 10 }} }} }}, y: {{ beginAtZero: true }} }} }}
-}});
-
-new Chart(document.getElementById('langChart'), {{
-  type: 'bar',
-  data: {{
-    labels: D.lang_daily.map(d => d.date),
-    datasets: [
-      {{ label: '🇮🇩 Indonesia', data: D.lang_daily.map(d => d.id), backgroundColor: '#ef4444', borderRadius: 2 }},
-      {{ label: '🌐 English', data: D.lang_daily.map(d => d.en), backgroundColor: '#3b82f6', borderRadius: 2 }},
-    ]
-  }},
-  options: {{ responsive: true,
-    plugins: {{ legend: {{ position: 'bottom', labels: {{ usePointStyle: true, padding: 16 }} }} }},
-    scales: {{ x: {{ stacked: true, ticks: {{ maxTicksLimit: 8, font: {{ size: 10 }} }} }},
-               y: {{ stacked: true, beginAtZero: true }} }} }}
 }});
 
 const srcColors = ['#6366f1','#8b5cf6','#a78bfa','#c4b5fd','#818cf8','#6366f1','#7c3aed','#5b21b6','#4f46e5','#4338ca','#3730a3','#312e81'];
@@ -3222,14 +3465,14 @@ if (D.heatmap_tags.length && D.heatmap.length) {{
 }}
 
 const insightEl = byId('insightContainer');
-const weekTotal = Math.max(Number(D.summary.total_7d || 0), 1);
+const weekTotal = Math.max(Number(D.summary.stories_7d != null ? D.summary.stories_7d : D.summary.total_7d), 1);
 const negShare = Math.round((Number(D.summary.negatif_7d || 0) / weekTotal) * 100);
 const topTag = (D.heatmap_tags && D.heatmap_tags[0]) || '—';
 const topSourceItem = (D.sources || []).find(source => source.source);
 const topSource = topSourceItem ? topSourceItem.source : '—';
 insightEl.innerHTML = [
   ['Last article seen', D.summary.last_seen || 'No article recorded yet'],
-  ['Negative share', negShare + '% of 7-day articles'],
+  ['Negative share', negShare + '% of 7-day stories'],
   ['Top topic', topTag],
   ['Top source', topSource],
 ].map(([label, value]) => '<div class="insight"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>').join('');
@@ -3237,10 +3480,14 @@ insightEl.innerHTML = [
 const healthEl = byId('sourceHealthContainer');
 if (D.source_health && D.source_health.length) {{
   healthEl.innerHTML = D.source_health.map(s => {{
-    const status = s.status === 'warning' ? 'warning' : 'ok';
-    const label = status === 'warning' ? `${{Number(s.fails || 0)}} fail` : 'ok';
+    const known = ['down', 'warning', 'quiet', 'ok'];
+    const status = known.includes(s.status) ? s.status : 'ok';
+    const label = s.note || status;
+    const detail = status === 'down' && s.last_error
+      ? esc(String(s.last_error).slice(0, 70))
+      : 'avg ' + esc(s.avg ?? 0) + ' articles/fetch';
     return '<div class="status-row">' +
-      '<div><strong>' + esc(s.source || '-') + '</strong><div class="src">avg ' + esc(s.avg ?? 0) + ' articles/fetch</div></div>' +
+      '<div><strong>' + esc(s.source || '-') + '</strong><div class="src">' + detail + '</div></div>' +
       '<span class="status-pill status-' + status + '">' + esc(label) + '</span>' +
     '</div>';
   }}).join('');
@@ -3258,8 +3505,8 @@ const clusterEl = byId('clusterContainer');
 if (D.clusters && D.clusters.length) {{
   clusterEl.innerHTML = D.clusters.map(c => '<div class="cluster-item">' +
     '<div class="item-top"><span class="item-title">' + esc(c.topic) + '</span><span class="pill ' + (c.tone === 'negative' ? 'pill-high' : 'pill-medium') + '">' +
-    esc(c.articles) + ' articles</span></div>' +
-    '<div class="item-meta">' + esc(c.sources || 0) + ' sources | ' + esc(c.negative || 0) + ' negative | trend ' +
+    esc(c.stories != null ? c.stories : c.articles) + ' stories</span></div>' +
+    '<div class="item-meta">' + esc(c.articles || 0) + ' articles | ' + esc(c.sources || 0) + ' outlets | ' + esc(c.negative || 0) + ' negative | trend ' +
     (Number(c.trend || 0) >= 0 ? '+' : '') + esc(c.trend || 0) + '</div>' +
     (c.latest ? '<div class="item-meta"><a href="' + safeUrl(c.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(c.latest).slice(0, 120)) + '</a></div>' : '') +
   '</div>').join('');
@@ -3284,7 +3531,10 @@ if (D.priority_articles && D.priority_articles.length) {{
   priorityEl.innerHTML = D.priority_articles.map(a => '<tr>' +
     '<td><span class="pill ' + priorityClass(a.priority) + '">' + esc(a.priority) + '</span><div class="item-meta">' + esc(a.score || 0) + '/100</div></td>' +
     '<td>' + esc(a.topic || '-') + '<div class="item-meta">' + esc(a.time || '') + '</div></td>' +
-    '<td><a href="' + safeUrl(a.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(a.title || '').slice(0, 140)) + '</a></td>' +
+    '<td><a href="' + safeUrl(a.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(a.title || '').slice(0, 140)) + '</a>' +
+      (Number(a.outlet_count || 1) > 1
+        ? '<div class="item-meta">Diberitakan ' + esc(a.outlet_count) + ' outlet: ' + esc((a.outlets || []).join(', ')) + '</div>'
+        : '') + '</td>' +
     '<td>' + esc(a.source || '-') + '<div class="item-meta">' + esc(a.sentiment || '') + '</div></td>' +
     '<td>' + esc(a.reason || '') + '</td>' +
   '</tr>').join('');
@@ -3331,14 +3581,16 @@ function renderArticles(containerId, articles, dotColor) {{
 renderArticles('posArticles', D.top_positive, '#4ade80');
 renderArticles('negArticles', D.top_negative, '#f87171');
 
+// Votes come from Telegram taps and are almost always absent, so the panel only
+// appears once there is something in it instead of holding a full card for a
+// permanent empty state.
 const rxEl = document.getElementById('reactionsContainer');
 if (D.reactions.length) {{
+  document.getElementById('reactionsCard').hidden = false;
   rxEl.innerHTML = D.reactions.map(r => '<div class="reaction-item">' +
       '<span class="reaction-votes">👍' + Number(r.ups || 0) + ' 👎' + Number(r.downs || 0) + '</span>' +
       '<a href="' + safeUrl(r.url) + '" target="_blank" rel="noopener noreferrer">' + esc(String(r.title || '').slice(0, 80)) + '</a></div>'
   ).join('');
-}} else {{
-  rxEl.innerHTML = empty('Belum ada vote — tap 👍/👎 di Telegram');
 }}
 
 const sentDotColor = {{'Positif': '#4ade80', 'Negatif': '#f87171', 'Netral': '#64748b'}};
@@ -3354,9 +3606,9 @@ function renderFeed(filter) {{
     if (!query) return true;
     return [a.title, a.source, a.sentiment, a.lang, ...(a.tags || [])].join(' ').toLowerCase().includes(query);
   }});
-  countEl.textContent = articles.length + ' artikel';
+  countEl.textContent = articles.length + ' cerita';
   if (!articles.length) {{
-    el.innerHTML = '<div class="feed-empty">Tidak ada artikel untuk filter ini</div>';
+    el.innerHTML = '<div class="feed-empty">Tidak ada cerita untuk filter ini</div>';
     return;
   }}
   el.innerHTML = articles.map(a => {{
@@ -3370,6 +3622,10 @@ function renderFeed(filter) {{
       '</div>' +
       '<div class="headline-meta">' +
         '<span>📌 ' + esc(String(a.source || '').slice(0, 25)) + '</span>' +
+        (Number(a.outlet_count || 1) > 1
+          ? '<span class="outlet-chip" title="' + esc((a.outlets || []).join(', ')) + '">+' +
+            esc(Number(a.outlet_count) - 1) + ' outlet</span>'
+          : '') +
         '<span>🕒 ' + esc(a.time || '') + '</span>' +
         (flag ? '<span>' + flag + '</span>' : '') +
         tags +
