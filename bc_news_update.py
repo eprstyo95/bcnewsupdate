@@ -58,6 +58,162 @@ QUERY_RSS_EN = (
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Perusahaan fasilitas di bawah Marunda ────────────────────────────────────
+# Facility companies (kawasan berikat, gudang berikat, PLB) in this office's
+# jurisdiction. News about them rarely uses the word "cukai", so the customs
+# queries above never fetch it — of 14,657 articles collected before this list
+# existed, 9 mentioned any of these companies. They therefore get their own
+# Google News query and their own relevance rule.
+MARUNDA_COMPANIES = [
+    "Akino Indonesia Trading",
+    "Andalan Manis Sejahtera",
+    "Anugrah Citra Rekonindo",
+    "Bgr Logistik Indonesia",
+    "Chargeurs Pcc Indonesia",
+    "Chori Indonesia",
+    "Global Buana Samudra",
+    "Harrys Pack Jaya",
+    "Is Textile Indonesia",
+    "Jaya Interlining Indonesia",
+    "Karya Unggul Sakti",
+    "Kisco Indonesia",
+    "Putra Bangsingja Perkasa",
+    "Saranaguna Makmurpersada",
+    "Sarinah",
+    "Tabitha Sentra Logistic",
+    "Mitsui Soko Logistic",
+    "Young-Il Indonesia",
+    "Amos Indah Indonesia",
+    "Asian Collections Garments",
+    "Asiapalm Oleo Jaya",
+    "Bna Indonesia",
+    "Continental Panjipratama",
+    "Dahu Furniture Indonesia",
+    "Daijo Industrial",
+    "Dayup Indo",
+    "Dodo Activewear",
+    "Dong A-Decal",
+    "Dong Jung Indonesia",
+    "Doo Seung Global",
+    "Doosan Cipta Busana Jaya",
+    "Dragon Forever",
+    "Equator Fat Indonesia",
+    "Eternal Beauty Indonesia",
+    "Fucolor Chemical Industry",
+    "Global Trims Creator",
+    "Golden Garments Indonesia",
+    "Gunung Abadi",
+    "Hansae Indonesia Utama",
+    "Hinomoto Indonesia",
+    "Deep Season Indonesia",
+    "Indomaguro Tunas Unggul",
+    "Indonesia Bestcare International Industry",
+    "Indonesian Aluminium Industry",
+    "Indosox Mills",
+    "International Furniture Industries",
+    "Jyt Caster Indonesia",
+    "Kahoindah Citragarment",
+    "Kawasan Berikat Nusantara",
+    "Kh International",
+    "Komatsu Indonesia",
+    "Merfindo Prima Jaya",
+    "Mitrabusana Apparelindo",
+    "Newlife Healthcare International",
+    "Orson Indonesia",
+    "Plasti Form Indonesia",
+    "Prima Universal",
+    "Rolls Stone Indonesia",
+    "Roma Stone Indonesia",
+    "Sari Dumai Oleo",
+    "Semesta Sukses Makmur Industry",
+    "Sinar Antjol",
+    "Sino Zone Industry Indonesia",
+    "Sioen Indonesia",
+    "Sunshine Global",
+    "Suryamandiri Tekstilbuana",
+    "Tainan Enterprises Indonesia",
+    "Tarzan Plastindo International",
+    "Tona Sanitary Hardware",
+    "Top Sky Multi Industries",
+    "Tpinc Trading Jakarta",
+    "Bali Quartz Indonesia",
+    "Mega Joy Indonesia",
+    "Light Sign Display",
+    "Tsunami Technology International",
+    "Artin Tech Indonesia",
+    "Aberu Cahaya Semesta",
+    "Basf Distribution Indonesia",
+    "Bina Sinar Amity",
+    "Bintan Matra Logistik",
+    "Catur Kusumayuda Logistik",
+    "Cipta Krida Bahari",
+    "Container Sukses Logistik",
+    "Control Systems Arena Para Nusa",
+    "Dhl Global Forwarding Indonesia",
+    "Ikrar Bersama Mandiri",
+    "Indoturbine",
+    "Kbn Prima Logistik",
+    "Logistik Anak Nusa Bangsa",
+    "Maersk Logistics Indonesia",
+    "Mitra Karya Manunggal Trans",
+    "Monang Sianipar Abadi",
+    "Niaga Intijaya Perkasa",
+    "Nurindo Pratama Logistik",
+    "Pelabuhan Penajam Banua Taka",
+    "Puninar Saranaraya",
+    "Sarana Gemilang",
+    "Sentra Mitra Selaras",
+    "Sinergi Agro Nusantara",
+    "Trakindo Utama",
+    "Transcon Indonesia",
+    "Tungya Collins Terminal",
+    "United Tractors",
+    "Kingtown Trading Investment",
+    "Eka Nuri",
+    "Mega Suksestama Abadi",
+    "Sentra Tirta Caturrasa",
+    "Yts Segar Indo Makmur",
+    "Dekra Laras Abadi",
+    "Gateway Container Line",
+    "Masaji Kargosentra Tama",
+    "Mitsui Soko Indonesia",
+    "Multi Bina Pura International",
+    "Oocl Logistics Indonesia",
+    "Sarana Prima Logistindo",
+    "Segara Pasific Maju",
+    "Astra Daihatsu Motor",
+    "Eterna Jayatama Industries",
+    "Osaga Mas Utama",
+    "Tembaga Mulia Semanan",
+    "Toyota Motor Manufacturing Indonesia",
+    "Zyrexindo Mandiri Buana Tbk",
+    "Permata Marindo Jaya",
+    "Akebono Brake Astra Indonesia",
+    "International Chemical Industry",
+    "Intercallin",
+    "Cahaya Surya Rejeki",
+]
+
+# Google News rejects an over-long query, so the companies are swept a slice at
+# a time, the cursor surviving in bot_state. At MARUNDA_QUERY_BATCH=12 a full
+# sweep takes 11 runs, and every company is checked several times inside the
+# 24-hour window the query asks for.
+MARUNDA_QUERY_BATCH = 12
+
+# Short names without "Indonesia" in them read as ordinary phrases: "Sarinah" is
+# a Jakarta landmark and "Dragon Forever" is a Jackie Chan film, both of which
+# matched real search results. These need the company spelled as "PT <name>", or
+# customs context somewhere in the article, before they count.
+MARUNDA_AMBIGUOUS = {
+    c.lower() for c in MARUNDA_COMPANIES
+    if len(c.split()) <= 2 and "indonesia" not in c.lower()
+}
+MARUNDA_CONTEXT_TERMS = [
+    "kawasan berikat", "gudang berikat", "pusat logistik berikat", "plb",
+    "bea cukai", "kepabeanan", "marunda", "pabrik", "kawasan industri",
+    "ekspor", "impor",
+]
+
 MAX_AGE_HOURS = 24
 
 GOOGLE_RSS_SIZE = 30
@@ -141,11 +297,33 @@ RELEVANCE_BLOCKLIST = [
 ]
 
 
+def match_marunda_company(title: str, description: str = ""):
+    """Return the jurisdiction company a text is about, or None.
+
+    Names are matched on word boundaries so "Sarinah" does not fire inside
+    "Sarinahnya", and the handful of names that are ordinary words on their own
+    additionally need company or customs context nearby.
+    """
+    text = f"{title} {description}".lower()
+    for company in MARUNDA_COMPANIES:
+        needle = company.lower()
+        if not re.search(rf"\b{re.escape(needle)}\b", text):
+            continue
+        if needle in MARUNDA_AMBIGUOUS:
+            named_as_company = re.search(rf"\bpt\.?\s+{re.escape(needle)}\b", text)
+            if not named_as_company and not any(c in text for c in MARUNDA_CONTEXT_TERMS):
+                continue
+        return company
+    return None
+
+
 def is_relevant(title: str, description: str = "") -> bool:
     """
     Two-layer relevance check for ALL fetched items.
 
-    Layer 1 — must match at least one RELEVANCE_REQUIRED_KEYWORDS.
+    Layer 1 — must match at least one RELEVANCE_REQUIRED_KEYWORDS, or name a
+              company in this office's jurisdiction. A company article often
+              never says "cukai", which is exactly why it needs its own way in.
     Layer 2 — reject if blocklist terms dominate over relevant hits
               (catches articles that mention bea cukai once in a
                budget table but are really about APBN/OJK/etc.).
@@ -153,6 +331,11 @@ def is_relevant(title: str, description: str = "") -> bool:
     text = f"{title} {description}".lower()
 
     relevant_hits = sum(1 for kw in RELEVANCE_REQUIRED_KEYWORDS if kw in text)
+    if match_marunda_company(title, description):
+        # A named company is a strong signal on its own, so it counts as two
+        # hits and survives the blocklist check below — company news legitimately
+        # mentions saham or pajak without being about either.
+        relevant_hits += 2
     if relevant_hits == 0:
         return False
 
@@ -652,7 +835,7 @@ def init_db(con: sqlite3.Connection):
     # carry counters no live code updates. A feed dropped from DIRECT_RSS_FEEDS
     # leaves the same kind of orphan: nothing refreshes it, so its last status
     # sits on the dashboard forever.
-    live_sources = set(DIRECT_RSS_FEEDS) | {"GoogleNews-ID", "GoogleNews-EN"}
+    live_sources = set(DIRECT_RSS_FEEDS) | {"GoogleNews-ID", "GoogleNews-EN", "GoogleNews-Marunda"}
     placeholders = ", ".join("?" for _ in live_sources)
     cur.execute(f"DELETE FROM source_health WHERE source_name NOT IN ({placeholders})",
                 tuple(live_sources))
@@ -868,6 +1051,10 @@ def make_hashtags(title: str, url: str = ""):
         (["sanctions", "embargo"], "#Sanctions"),
     ]
     out = []
+    # A jurisdiction company leads the tags — it is the reason the article was
+    # kept, so it should survive the five-tag cut.
+    if match_marunda_company(title):
+        out.append("#PerusahaanMarunda")
     for keys, tag in TAGS:
         if any(k in t or k in u for k in keys):
             out.append(tag)
@@ -1122,6 +1309,10 @@ def _send_single_article(session, it):
     lines.append("")
     lines.append(f"🕒 {fmt_wib(pub)}")
     lines.append(f"📌 {src_h} {lang_flag}")
+
+    company = match_marunda_company(title, description)
+    if company:
+        lines.append(f"🏭 <b>Perusahaan fasilitas Marunda:</b> {html.escape(company)}")
     lines.append(f"{sent_emoji} Sentimen: <b>{sent_label}</b>")
     lines.append(f"🏷️ {tags_h}")
 
@@ -1157,6 +1348,30 @@ def _send_single_article(session, it):
 # =========================
 # GOOGLE NEWS RSS
 # =========================
+def next_marunda_query(con):
+    """Build the company query for this run and advance the cursor.
+
+    The whole list in one query is far past what Google News accepts, so each
+    run takes the next slice and the cursor wraps around, giving every company
+    a turn.
+    """
+    if not MARUNDA_COMPANIES:
+        return "", []
+    try:
+        cursor = int(get_bot_state(con, "marunda_query_cursor", "0") or 0)
+    except ValueError:
+        cursor = 0
+    cursor %= len(MARUNDA_COMPANIES)
+
+    slice_ = [MARUNDA_COMPANIES[(cursor + i) % len(MARUNDA_COMPANIES)]
+              for i in range(min(MARUNDA_QUERY_BATCH, len(MARUNDA_COMPANIES)))]
+    set_bot_state(con, "marunda_query_cursor",
+                  str((cursor + len(slice_)) % len(MARUNDA_COMPANIES)))
+
+    query = " OR ".join(f'"{name}"' for name in slice_) + " when:24h"
+    return query, slice_
+
+
 def fetch_google_news_rss(session, query, language="id"):
     if language == "id":
         rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=id&gl=ID&ceid=ID:id"
@@ -1184,7 +1399,10 @@ def fetch_google_news_rss(session, query, language="id"):
 # =========================
 def _matches_direct_keywords(title: str, description: str = "") -> bool:
     text = f"{title} {description}".lower()
-    return any(kw in text for kw in DIRECT_RSS_KEYWORDS)
+    if any(kw in text for kw in DIRECT_RSS_KEYWORDS):
+        return True
+    # The general-interest feeds carry company news that never says "cukai".
+    return match_marunda_company(title, description) is not None
 
 
 def fetch_direct_rss(session):
@@ -1256,11 +1474,26 @@ def cmd_run():
                                  error=f"{type(e).__name__}: {e}")
             print(f"  ⚠️ GoogleNews-EN failed: {type(e).__name__}: {e}")
 
+        marunda_query, marunda_slice = next_marunda_query(con)
+        rss_marunda = []
+        if marunda_query:
+            try:
+                rss_marunda = fetch_google_news_rss(session, marunda_query, language="id")
+                for item in rss_marunda:
+                    item["source"] = "GoogleNews-Marunda"
+                record_source_health(con, "GoogleNews-Marunda", len(rss_marunda))
+                print(f"  Marunda sweep: {len(rss_marunda)} raw for {len(marunda_slice)} companies "
+                      f"({marunda_slice[0]} … {marunda_slice[-1]})")
+            except Exception as e:
+                record_source_health(con, "GoogleNews-Marunda", 0, reachable=False,
+                                     error=f"{type(e).__name__}: {e}")
+                print(f"  ⚠️ GoogleNews-Marunda failed: {type(e).__name__}: {e}")
+
         direct_items, direct_health = fetch_direct_rss(session)
         for feed_name, (count, reachable, error) in direct_health.items():
             record_source_health(con, feed_name, count, reachable=reachable, error=error)
 
-        items = rss_id + rss_en + direct_items
+        items = rss_id + rss_en + rss_marunda + direct_items
 
         # ── CHANGE 2: Apply relevance filter to ALL items ─────────────────────
         pre_filter_count = len(items)
@@ -2411,6 +2644,10 @@ def cmd_dashboard():
         now_wib = now_utc.astimezone(WIB)
 
         watch_topics = [
+            # First in the list because _article_topic returns the first match:
+            # a named company is the more specific label for anything in this
+            # office's jurisdiction, whatever else the article is also about.
+            ("Perusahaan Fasilitas Marunda", [c.lower() for c in MARUNDA_COMPANIES]),
             ("KPK / Korupsi", ["kpk", "korupsi", "suap", "gratifikasi", "tersangka", "amplop"]),
             ("Dirjen / Pimpinan", ["dirjen", "direktur jenderal", "djaka", "pencopotan", "diganti"]),
             ("Purbaya / Kemenkeu", ["purbaya", "menkeu", "kemenkeu", "menteri keuangan"]),
