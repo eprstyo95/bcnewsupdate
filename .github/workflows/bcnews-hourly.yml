@@ -17,13 +17,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # seen.sqlite is committed, so the checkout is the authoritative DB. It is
+      # deliberately not restored from actions/cache: the save key carries the run
+      # id so the exact key never hits, and the prefix restore-keys would lay an
+      # older DB over the checked-out one, making its articles look unseen again.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: true
           fetch-depth: 1
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -31,15 +35,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Restore seen database cache
-        uses: actions/cache/restore@v4
-        with:
-          path: seen.sqlite
-          key: seen-db-v2-${{ runner.os }}-${{ github.ref_name }}
-          restore-keys: |
-            seen-db-v2-${{ runner.os }}-${{ github.ref_name }}-
-            seen-db-v2-${{ runner.os }}-
-            seen-db-v2-
       - name: Run bc news update
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -58,19 +53,4 @@ jobs:
         run: |
           python bc_news_update.py dashboard
       - name: Commit dashboard and database when changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f seen.sqlite
-          git add docs/index.html docs/.nojekyll 2>/dev/null || true
-          if git diff --cached --quiet; then
-            echo "Nothing changed, skipping commit"
-          else
-            git commit -m "chore: update news db and dashboard [skip ci]"
-            git push
-          fi
-      - name: Save seen database cache
-        uses: actions/cache/save@v4
-        with:
-          path: seen.sqlite
-          key: seen-db-v2-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+        run: bash scripts/ci_commit_push.sh

@@ -3653,6 +3653,63 @@ renderFeed('all');
 
 
 # =============================================================================
+# MERGE DB
+# =============================================================================
+def cmd_merge_db():
+    """Union the rows of another copy of seen.sqlite into this one.
+
+    CI needs this when a push is rejected because a concurrent run already
+    pushed. seen.sqlite is binary, so keeping either file whole drops the other
+    run's rows — and a dropped row means the article is treated as unseen and
+    gets sent to Telegram again. Every table is keyed, so INSERT OR IGNORE keeps
+    the local rows and adds only what the incoming copy has on top.
+    """
+    path = sys.argv[2] if len(sys.argv) > 2 else ""
+    if not path:
+        print("Usage: bc_news_update.py merge-db <other.sqlite>")
+        sys.exit(1)
+    if not os.path.exists(path):
+        print(f"❌ merge-db: {path} not found")
+        sys.exit(1)
+
+    con = sqlite3.connect(DB_FILE)
+    try:
+        init_db(con)
+        cur = con.cursor()
+        cur.execute("ATTACH DATABASE ? AS incoming", (path,))
+        try:
+            tables = [r[0] for r in cur.execute(
+                "SELECT name FROM incoming.sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()]
+            total = 0
+            for table in tables:
+                local_cols = {r[1] for r in cur.execute(f'PRAGMA main.table_info("{table}")')}
+                if not local_cols:
+                    print(f"⏭  {table}: absent locally, skipped")
+                    continue
+                shared = [r[1] for r in cur.execute(f'PRAGMA incoming.table_info("{table}")')
+                          if r[1] in local_cols]
+                if not shared:
+                    continue
+                cols = ", ".join(f'"{c}"' for c in shared)
+                before = cur.execute(f'SELECT COUNT(*) FROM main."{table}"').fetchone()[0]
+                cur.execute(
+                    f'INSERT OR IGNORE INTO main."{table}" ({cols}) '
+                    f'SELECT {cols} FROM incoming."{table}"'
+                )
+                after = cur.execute(f'SELECT COUNT(*) FROM main."{table}"').fetchone()[0]
+                total += after - before
+                print(f"   {table}: +{after - before} rows (now {after})")
+            con.commit()
+        finally:
+            cur.execute("DETACH DATABASE incoming")
+        print(f"✅ merge-db: {total} new rows from {path}")
+    finally:
+        con.close()
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main():
@@ -3666,6 +3723,7 @@ def main():
         "report": cmd_report,
         "dashboard": cmd_dashboard,
         "backfill": cmd_backfill,
+        "merge-db": cmd_merge_db,
         "poll": cmd_poll,
         "setup": cmd_setup,
     }
