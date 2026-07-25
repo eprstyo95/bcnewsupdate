@@ -649,8 +649,13 @@ def init_db(con: sqlite3.Connection):
             print(f"  ➕ Added column: source_health.{col_name}")
 
     # Direct feeds are tracked one row per feed now, so the old lumped rows only
-    # carry counters no live code updates.
-    cur.execute("DELETE FROM source_health WHERE source_name IN ('DirectRSS', 'GoogleNews RSS')")
+    # carry counters no live code updates. A feed dropped from DIRECT_RSS_FEEDS
+    # leaves the same kind of orphan: nothing refreshes it, so its last status
+    # sits on the dashboard forever.
+    live_sources = set(DIRECT_RSS_FEEDS) | {"GoogleNews-ID", "GoogleNews-EN"}
+    placeholders = ", ".join("?" for _ in live_sources)
+    cur.execute(f"DELETE FROM source_health WHERE source_name NOT IN ({placeholders})",
+                tuple(live_sources))
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
