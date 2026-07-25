@@ -157,9 +157,12 @@ def is_relevant(title: str, description: str = "") -> bool:
 MAX_ITEMS_PER_BATCH = 1
 SEND_HEARTBEAT = True
 
-# When the heartbeat is sent: "always" every run (288 a day at the 5-minute
-# schedule), "news" only on runs that found something, "never" to switch it off.
-HEARTBEAT_WHEN = os.environ.get("HEARTBEAT_WHEN", "always").strip().lower()
+# When the heartbeat is sent: "always" every run, "news" only on runs that found
+# something, "never" to switch it off. Now that it goes to the private chat
+# rather than the group, "always" would be 288 messages a day at the 5-minute
+# schedule, so it only reports when there is something to report. A failed run
+# still sends its own alert, so silence does not hide a broken monitor.
+HEARTBEAT_WHEN = os.environ.get("HEARTBEAT_WHEN", "news").strip().lower()
 
 INCLUDE_SNIPPET = True
 SNIPPET_MAX_CHARS = 150
